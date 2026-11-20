@@ -1,0 +1,424 @@
+// An objective: the function, and how to get its gradient and Hessian
+// (given, by AD, by the complex step or by finite differences).
+// `Eval` wraps one for a run and counts the evaluations.
+
+use pkg::diff::{Diff, approx_grad, approx_hessian, complex_step_grad, hessian_from_grad};
+use pkg::dual::{plain, plain_var};
+use autodiff::{Dual, Var};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+pub(pkg) enum Grad {
+    Approx(Diff),
+    Given(fn(Vector<f64>) -> Vector<f64>),
+    Both(fn(Vector<f64>) -> (f64, Vector<f64>)),
+}
+
+pub(pkg) enum Hess {
+    Approx,
+    Given(fn(Vector<f64>) -> Matrix<f64>),
+    Product(fn(Vector<f64>, Vector<f64>) -> Vector<f64>),
+}
+
+/// A function to minimize, `f: R^n -> R`, with its derivatives. Every
+/// solver takes an `Objective` or anything that becomes one
+/// (`IntoObjective`): a plain closure `|x: Vector<f64>| -> f64` (the
+/// gradient by central differences), a closure over `Dual` numbers
+/// (the gradient by forward-mode AD, exact), over `Var` (reverse-mode
+/// AD, exact, one sweep) or over `Complex<f64>`
+/// (the complex step, exact). Add what you know with the builder
+/// methods.
+///
+/// ```nabi
+/// use optimize::Objective;
+/// use core::array::{Array, Vector};
+///
+/// let f = |x: Vector<f64>| -> f64 { (x[0] - 1.0) ** 2 + 10.0 * (x[1] + 2.0) ** 2 };
+/// let g = |x: Vector<f64>| -> Vector<f64> { Array::from([2.0 * (x[0] - 1.0), 20.0 * (x[1] + 2.0)]) };
+/// let m = try optimize::bfgs(Objective::new(f).with_grad(g), [0.0, 0.0]);
+/// assert(m.success() && (m.x[1] + 2.0).abs() < 1e-6);
+/// ```
+pub struct Objective {
+    pub(pkg) f: fn(Vector<f64>) -> f64;
+    pub(pkg) g: Grad = Grad::Approx(Diff::Central);
+    pub(pkg) h: Hess = Hess::Approx;
+}
+
+impl Objective {
+    /// `f` alone: the gradient by central differences, the Hessian by
+    /// differences of the gradient.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let o = optimize::Objective::new(|x: Vector<f64>| -> f64 { x[0] * x[0] });
+    /// assert(o.value([3.0]) == 9.0);
+    /// ```
+    pub fn new(f: fn(Vector<f64>) -> f64) -> Objective { Objective { f } }
+
+    /// `f` written over dual numbers: the value and the exact gradient
+    /// by forward-mode AD (`n` passes), the Hessian by differences of
+    /// that gradient.
+    ///
+    /// ```nabi
+    /// use optimize::{Dual, Objective};
+    /// use core::array::Vector;
+    ///
+    /// let o = Objective::dual(|x: Vector<Dual>| -> Dual { x[0] * x[0] * x[1] });
+    /// assert(o.gradient([2.0, 3.0])[0] == 12.0);
+    /// ```
+    pub fn dual(f: fn(Vector<Dual>) -> Dual) -> Objective {
+        Objective { f: plain(f), g: Grad::Both(|x: Vector<f64>| -> (f64, Vector<f64>) { autodiff::value_grad(f, x) }) }
+    }
+
+    /// `f` recorded on a tape: the value and the exact gradient by
+    /// reverse-mode AD (one evaluation and one backward sweep, whatever
+    /// `n` is), the Hessian by differences of that gradient. The choice
+    /// for many variables.
+    ///
+    /// ```nabi
+    /// use optimize::{Objective, Var};
+    /// use core::array::Vector;
+    ///
+    /// let o = Objective::reverse(|x: Vector<Var>| -> Var { x[0] * x[0] * x[1] });
+    /// assert(o.gradient([2.0, 3.0])[0] == 12.0);
+    /// ```
+    pub fn reverse(f: fn(Vector<Var>) -> Var) -> Objective {
+        Objective { f: plain_var(f), g: Grad::Both(|x: Vector<f64>| -> (f64, Vector<f64>) { autodiff::value_grad(f, x) }) }
+    }
+
+    /// `f` written over complex numbers: the gradient by the complex
+    /// step (`n` evaluations, exact to rounding). `f` must be the
+    /// analytic continuation of the real function (see `Smooth`).
+    ///
+    /// ```nabi
+    /// use optimize::{Objective, Smooth};
+    /// use core::array::Vector;
+    /// use core::num::Complex;
+    ///
+    /// fn f<T: Smooth>(x: Vector<T>) -> T { x[0].exp() }
+    /// let o = Objective::complex(f::<Complex<f64>>);
+    /// assert(o.gradient([0.0])[0] == 1.0);
+    /// ```
+    pub fn complex(f: fn(Vector<Complex<f64>>) -> Complex<f64>) -> Objective {
+        let fr = |x: Vector<f64>| -> f64 {
+            let z: Vector<Complex<f64>> = Array::from_fn([x.len()], |ix: [usize; 1]| -> Complex<f64> { Complex::new(x[ix[0]], 0.0) });
+            f(z).re
+        };
+        Objective { f: fr, g: Grad::Given(|x: Vector<f64>| -> Vector<f64> { complex_step_grad(f, x) }) }
+    }
+
+    /// With the exact gradient `g`.
+    ///
+    /// ```nabi
+    /// use optimize::Objective;
+    /// use core::array::Vector;
+    ///
+    /// let o = Objective::new(|x: Vector<f64>| -> f64 { x[0] ** 2 }).with_grad(|x: Vector<f64>| -> Vector<f64> { x .* 2.0 });
+    /// assert(o.gradient([1.5])[0] == 3.0);
+    /// ```
+    pub fn with_grad(self, g: fn(Vector<f64>) -> Vector<f64>) -> Objective {
+        let o = self;
+        o.g = Grad::Given(g);
+        o
+    }
+
+    /// With one function that gives the value and the gradient together
+    /// (cheaper when they share work); `f` stays for value-only calls.
+    ///
+    /// ```nabi
+    /// use optimize::Objective;
+    /// use core::array::Vector;
+    ///
+    /// let o = Objective::new(|x: Vector<f64>| -> f64 { x[0] ** 2 })
+    ///     .with_value_grad(|x: Vector<f64>| -> (f64, Vector<f64>) { (x[0] ** 2, x .* 2.0) });
+    /// assert(o.gradient([2.0])[0] == 4.0);
+    /// ```
+    pub fn with_value_grad(self, fg: fn(Vector<f64>) -> (f64, Vector<f64>)) -> Objective {
+        let o = self;
+        o.g = Grad::Both(fg);
+        o
+    }
+
+    /// With the exact Hessian `h` (used by `newton_cg`, `trust_dogleg`,
+    /// `trust_ncg`).
+    ///
+    /// ```nabi
+    /// use optimize::Objective;
+    /// use core::array::{Array, Matrix, Vector};
+    ///
+    /// let o = Objective::new(|x: Vector<f64>| -> f64 { x[0] ** 2 })
+    ///     .with_hess(|_x: Vector<f64>| -> Matrix<f64> { Array::full([1, 1], 2.0) });
+    /// assert(o.hessian([0.0])[0, 0] == 2.0);
+    /// ```
+    pub fn with_hess(self, h: fn(Vector<f64>) -> Matrix<f64>) -> Objective {
+        let o = self;
+        o.h = Hess::Given(h);
+        o
+    }
+
+    /// With the Hessian-vector product `hv(x, v) = H(x) v`, which is all
+    /// `newton_cg` and `trust_ncg` need (no `n x n` matrix).
+    ///
+    /// ```nabi
+    /// use optimize::Objective;
+    /// use core::array::Vector;
+    ///
+    /// let o = Objective::new(|x: Vector<f64>| -> f64 { x[0] ** 2 })
+    ///     .with_hessp(|_x: Vector<f64>, v: Vector<f64>| -> Vector<f64> { v .* 2.0 });
+    /// assert(o.hessian([1.0])[0, 0] == 2.0);
+    /// ```
+    pub fn with_hessp(self, hv: fn(Vector<f64>, Vector<f64>) -> Vector<f64>) -> Objective {
+        let o = self;
+        o.h = Hess::Product(hv);
+        o
+    }
+
+    /// With the finite-difference scheme for the gradient (when it is
+    /// not given): `Diff::Forward` halves the cost, `Diff::Central` (the
+    /// default) is more accurate.
+    ///
+    /// ```nabi
+    /// use optimize::{Diff, Objective};
+    /// use core::array::Vector;
+    ///
+    /// let o = Objective::new(|x: Vector<f64>| -> f64 { x[0] ** 2 }).with_diff(Diff::Forward);
+    /// assert((o.gradient([1.0])[0] - 2.0).abs() < 1e-6);
+    /// ```
+    pub fn with_diff(self, d: Diff) -> Objective {
+        let o = self;
+        match o.g {
+            Grad::Approx(_) => { o.g = Grad::Approx(d); }
+            _ => {}
+        }
+        o
+    }
+
+    /// `f(x)`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// assert(optimize::Objective::new(|x: Vector<f64>| -> f64 { x.sum() }).value([1.0, 2.0]) == 3.0);
+    /// ```
+    pub fn value(self, x: Vector<f64>) -> f64 { (self.f)(x) }
+
+    /// The gradient at `x`, by the way this objective was built.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let g = optimize::Objective::new(|x: Vector<f64>| -> f64 { 3.0 * x[0] }).gradient([1.0]);
+    /// assert((g[0] - 3.0).abs() < 1e-9);
+    /// ```
+    pub fn gradient(self, x: Vector<f64>) -> Vector<f64> {
+        match self.g {
+            Grad::Approx(d) => approx_grad(self.f, x, d),
+            Grad::Given(g) => g(x),
+            Grad::Both(fg) => fg(x).1,
+        }
+    }
+
+    /// The Hessian at `x`: given, from Hessian-vector products, by
+    /// differences of a known gradient, or by second differences of `f`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let h = optimize::Objective::new(|x: Vector<f64>| -> f64 { x[0] * x[1] }).hessian([1.0, 1.0]);
+    /// assert((h[0, 1] - 1.0).abs() < 1e-5);
+    /// ```
+    pub fn hessian(self, x: Vector<f64>) -> Matrix<f64> {
+        let n = x.len();
+        match self.h {
+            Hess::Given(h) => h(x),
+            Hess::Product(hv) => {
+                let m: Matrix<f64> = Array::zeros([n, n]);
+                for k in 0..n {
+                    let e: Vector<f64> = Array::zeros([n]);
+                    e[k] = 1.0;
+                    let c = hv(x, e);
+                    for i in 0..n { m[i, k] = c[i]; }
+                }
+                m
+            }
+            Hess::Approx => match self.g {
+                Grad::Approx(_) => approx_hessian(self.f, x),
+                _ => {
+                    let o = self;
+                    hessian_from_grad(|y: Vector<f64>| -> Vector<f64> { o.gradient(y) }, x)
+                }
+            },
+        }
+    }
+}
+
+/// What a solver accepts as its objective: an `Objective`, or a closure
+/// over `f64` (`Objective::new`), `Dual` (`Objective::dual`), `Var`
+/// (`Objective::reverse`) or `Complex<f64>` (`Objective::complex`).
+///
+/// ```nabi
+/// use optimize::{Dual, IntoObjective};
+/// use core::array::Vector;
+///
+/// let o = (|x: Vector<Dual>| -> Dual { x[0].exp() }).into_objective();
+/// assert(o.gradient([0.0])[0] == 1.0);
+/// ```
+pub trait IntoObjective {
+    /// The objective.
+    fn into_objective(self) -> Objective;
+}
+
+impl IntoObjective for Objective {
+    fn into_objective(self) -> Objective { self }
+}
+
+impl IntoObjective for fn(Vector<f64>) -> f64 {
+    fn into_objective(self) -> Objective { Objective::new(self) }
+}
+
+impl IntoObjective for fn(Vector<Dual>) -> Dual {
+    fn into_objective(self) -> Objective { Objective::dual(self) }
+}
+
+impl IntoObjective for fn(Vector<Var>) -> Var {
+    fn into_objective(self) -> Objective { Objective::reverse(self) }
+}
+
+impl IntoObjective for fn(Vector<Complex<f64>>) -> Complex<f64> {
+    fn into_objective(self) -> Objective { Objective::complex(self) }
+}
+
+/// An objective during one run, with its evaluation counts.
+pub(pkg) struct Eval {
+    pub(pkg) o: Objective;
+    pub(pkg) nfev: usize = 0;
+    pub(pkg) ngev: usize = 0;
+    pub(pkg) nhev: usize = 0;
+}
+
+impl Eval {
+    pub(pkg) fn of(o: Objective) -> Eval { Eval { o } }
+
+    pub(pkg) fn f(ref self, x: Vector<f64>) -> f64 {
+        self.nfev += 1;
+        (self.o.f)(x)
+    }
+
+    /// The value and the gradient.
+    pub(pkg) fn fg(ref self, x: Vector<f64>) -> (f64, Vector<f64>) {
+        match self.o.g {
+            Grad::Approx(d) => {
+                let v = (self.o.f)(x);
+                self.nfev += 1 + match d { Diff::Forward => x.len() + 1, Diff::Central => 2 * x.len() };
+                (v, approx_grad(self.o.f, x, d))
+            }
+            Grad::Given(g) => {
+                self.nfev += 1;
+                self.ngev += 1;
+                ((self.o.f)(x), g(x))
+            }
+            Grad::Both(fg) => {
+                self.nfev += 1;
+                self.ngev += 1;
+                fg(x)
+            }
+        }
+    }
+
+    pub(pkg) fn g(ref self, x: Vector<f64>) -> Vector<f64> {
+        match self.o.g {
+            Grad::Approx(d) => {
+                self.nfev += match d { Diff::Forward => x.len() + 1, Diff::Central => 2 * x.len() };
+                approx_grad(self.o.f, x, d)
+            }
+            Grad::Given(g) => {
+                self.ngev += 1;
+                g(x)
+            }
+            Grad::Both(fg) => {
+                self.ngev += 1;
+                fg(x).1
+            }
+        }
+    }
+
+    pub(pkg) fn h(ref self, x: Vector<f64>) -> Matrix<f64> {
+        self.nhev += 1;
+        self.o.hessian(x)
+    }
+
+    /// `H(x) v`: given, from a given Hessian, or by a forward difference
+    /// of the gradient along `v` (`g` is the gradient at `x`).
+    pub(pkg) fn hv(ref self, x: Vector<f64>, g: Vector<f64>, v: Vector<f64>) -> Vector<f64> {
+        match self.o.h {
+            Hess::Product(hv) => {
+                self.nhev += 1;
+                hv(x, v)
+            }
+            Hess::Given(h) => {
+                self.nhev += 1;
+                let m = h(x);
+                let n = v.len();
+                let out: Vector<f64> = Array::zeros([n]);
+                for i in 0..n {
+                    let s = 0.0;
+                    for k in 0..n { s += m[i, k] * v[k]; }
+                    out[i] = s;
+                }
+                out
+            }
+            Hess::Approx => {
+                let vn = norm(v);
+                if vn == 0.0 { return Array::zeros([v.len()]); }
+                let xn = norm(x);
+                let t = 1.4901161193847656e-8 * (1.0 + xn) / vn;
+                let gp = self.g(x .+ t .* v);
+                (gp .- g) ./ t
+            }
+        }
+    }
+}
+
+/// `||x||_2`, scaled against overflow.
+pub(pkg) fn norm(x: Vector<f64>) -> f64 {
+    let s = 0.0;
+    let m = 0.0;
+    for v in x { m = m.max(v.abs()); }
+    if m == 0.0 || !m.is_finite() { return m; }
+    for v in x {
+        let t = v / m;
+        s += t * t;
+    }
+    m * s.sqrt()
+}
+
+/// `||x||_inf`.
+pub(pkg) fn inf_norm(x: Vector<f64>) -> f64 {
+    let m = 0.0;
+    for v in x {
+        let a = v.abs();
+        if a > m || a != a { m = a; }
+    }
+    m
+}
+
+/// `x . y`, with four partial sums (one sum is a serial dependency
+/// chain).
+pub(pkg) fn dot(x: Vector<f64>, y: Vector<f64>) -> f64 {
+    let n = x.len();
+    let (s0, s1, s2, s3) = (0.0, 0.0, 0.0, 0.0);
+    let i = 0;
+    while i + 4 <= n {
+        s0 += x[i] * y[i];
+        s1 += x[i + 1] * y[i + 1];
+        s2 += x[i + 2] * y[i + 2];
+        s3 += x[i + 3] * y[i + 3];
+        i += 4;
+    }
+    while i < n {
+        s0 += x[i] * y[i];
+        i += 1;
+    }
+    (s0 + s1) + (s2 + s3)
+}

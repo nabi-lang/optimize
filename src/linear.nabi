@@ -1,0 +1,462 @@
+// Linear and quadratic programs:
+//
+//   minimize   c^T x (+ x^T Q x / 2)
+//   subject to A_ub x <= b_ub, A_eq x = b_eq, lo <= x <= hi
+//
+// Both are moved to the standard form A x = b, x >= 0 (shifted and
+// mirrored variables, free ones split, finite upper bounds as rows,
+// slacks for the inequalities). Simplex: dense two-phase tableau with
+// Dantzig pricing and Bland's rule after a run of degenerate pivots
+// (no cycling). Interior point: Mehrotra's predictor-corrector
+// (Nocedal and Wright 2006, Algorithm 14.3 and 16.6) on the normal
+// equations, for LPs and convex QPs alike.
+
+pub mod ipm;
+pub mod simplex;
+
+use pkg::bound::Bounds;
+use pkg::error::{OptimizeError, finite, shape};
+use pkg::result::Status;
+use core::array::{Array, Matrix, Vector};
+
+/// The method of `linprog`.
+///
+/// ```nabi
+/// use optimize::{Lp, LpMethod};
+///
+/// let lp = Lp::new([-1.0, -2.0]).le([[1, 1]], [4.0]).bounds(try optimize::Bounds::uniform(2, 0.0, 3.0));
+/// let a = try optimize::linprog(lp, LpMethod::Simplex);
+/// let b = try optimize::linprog(lp, LpMethod::InteriorPoint);
+/// assert(a.fun == -7.0 && (b.fun + 7.0).abs() < 1e-7);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LpMethod {
+    /// Two-phase simplex: exact vertices, finite on degenerate problems.
+    Simplex,
+    /// Mehrotra predictor-corrector: few iterations on large problems;
+    /// the answer is within the tolerance of a vertex, not on one.
+    InteriorPoint,
+}
+
+/// A linear program, built up by its methods: `Lp::new(c)` minimizes
+/// `c^T x` over `x >= 0`; add rows with `le`, `ge` and `eq` and replace
+/// the default bounds with `bounds`.
+///
+/// ```nabi
+/// use optimize::Lp;
+///
+/// // max 3x + 2y with x + y <= 4, x + 3y <= 6, x <= 3: minimize the negative.
+/// let lp = Lp::new([-3.0, -2.0]).le([[1, 1], [1, 3], [1, 0]], [4.0, 6.0, 3.0]);
+/// let r = try optimize::linprog(lp);
+/// assert(r.success() && r.fun == -11.0 && r.x[0] == 3.0 && r.x[1] == 1.0);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Lp {
+    pub(pkg) c: Vector<f64>;
+    pub(pkg) q: Matrix<f64>;
+    pub(pkg) aub: List<Vector<f64>>;
+    pub(pkg) bub: List<f64>;
+    pub(pkg) aeq: List<Vector<f64>>;
+    pub(pkg) beq: List<f64>;
+    pub(pkg) lo: Vector<f64>;
+    pub(pkg) hi: Vector<f64>;
+}
+
+impl Lp {
+    /// Minimize `c^T x` subject to `x >= 0`.
+    ///
+    /// ```nabi
+    /// let r = try optimize::linprog(optimize::Lp::new([1.0, 2.0]));
+    /// assert(r.fun == 0.0);
+    /// ```
+    pub fn new(c: Vector<f64>) -> Lp {
+        let n = c.len();
+        Lp { c: c.copy(), q: Array::zeros([0, 0]), aub: [], bub: [], aeq: [], beq: [], lo: Array::zeros([n]), hi: Array::full([n], f64::INFINITY) }
+    }
+
+    /// With the rows `a x <= b`.
+    ///
+    /// ```nabi
+    /// let lp = optimize::Lp::new([-1.0]).le([[2]], [3.0]);
+    /// assert((try optimize::linprog(lp)).x[0] == 1.5);
+    /// ```
+    pub fn le(self, a: Matrix<f64>, b: Vector<f64>) -> Lp {
+        let lp = self;
+        for i in 0..a.shape()[0] {
+            lp.aub.push(a[i].copy());
+            lp.bub.push(if i < b.len() { b[i] } else { f64::NAN });
+        }
+        if b.len() != a.shape()[0] { lp.bub.push(f64::NAN); }
+        lp
+    }
+
+    /// With the rows `a x >= b`.
+    ///
+    /// ```nabi
+    /// let lp = optimize::Lp::new([1.0]).ge([[1]], [2.0]);
+    /// assert((try optimize::linprog(lp)).x[0] == 2.0);
+    /// ```
+    pub fn ge(self, a: Matrix<f64>, b: Vector<f64>) -> Lp { self.le(a .* -1.0, b .* -1.0) }
+
+    /// With the rows `a x = b`.
+    ///
+    /// ```nabi
+    /// let lp = optimize::Lp::new([1.0, 1.0]).eq([[1, 2]], [4.0]);
+    /// assert((try optimize::linprog(lp)).fun == 2.0);
+    /// ```
+    pub fn eq(self, a: Matrix<f64>, b: Vector<f64>) -> Lp {
+        let lp = self;
+        for i in 0..a.shape()[0] {
+            lp.aeq.push(a[i].copy());
+            lp.beq.push(if i < b.len() { b[i] } else { f64::NAN });
+        }
+        if b.len() != a.shape()[0] { lp.beq.push(f64::NAN); }
+        lp
+    }
+
+    /// With the box `b` in place of `x >= 0` (`Bounds::free(n)` for no
+    /// bounds at all).
+    ///
+    /// ```nabi
+    /// let lp = optimize::Lp::new([1.0]).bounds(try optimize::Bounds::uniform(1, -5.0, 5.0));
+    /// assert((try optimize::linprog(lp)).x[0] == -5.0);
+    /// ```
+    pub fn bounds(self, b: Bounds) -> Lp {
+        let lp = self;
+        lp.lo = b.lo.copy();
+        lp.hi = b.hi.copy();
+        lp
+    }
+
+    pub(pkg) fn check(self) throws (OptimizeError) {
+        let n = self.c.len();
+        if n == 0 { throw OptimizeError::Empty; }
+        try finite(self.c, "c");
+        if self.lo.len() != n { throw shape(f"bounds for {self.lo.len()} variables, c has {n}"); }
+        for i in 0..self.aub.len() {
+            if self.aub[i].len() != n { throw shape(f"row {i} of the <= rows has {self.aub[i].len()} columns, c has {n}"); }
+            try finite(self.aub[i], "a <= row");
+        }
+        for i in 0..self.aeq.len() {
+            if self.aeq[i].len() != n { throw shape(f"row {i} of the = rows has {self.aeq[i].len()} columns, c has {n}"); }
+            try finite(self.aeq[i], "an = row");
+        }
+        if self.bub.len() != self.aub.len() { throw shape(f"{self.aub.len()} <= rows but {self.bub.len()} right-hand sides"); }
+        if self.beq.len() != self.aeq.len() { throw shape(f"{self.aeq.len()} = rows but {self.beq.len()} right-hand sides"); }
+        for v in self.bub { if !v.is_finite() { throw OptimizeError::NotFinite { what: "a right-hand side" }; } }
+        for v in self.beq { if !v.is_finite() { throw OptimizeError::NotFinite { what: "a right-hand side" }; } }
+        for i in 0..n {
+            if self.lo[i] > self.hi[i] { throw OptimizeError::BadBounds { index: i, lo: self.lo[i], hi: self.hi[i] }; }
+        }
+    }
+}
+
+/// A convex quadratic program: minimize `x^T Q x / 2 + c^T x` with the
+/// rows and bounds of an `Lp` (`le`, `ge`, `eq`, `bounds`; `x` is
+/// free unless bounded). `Q` must be symmetric positive semidefinite.
+///
+/// ```nabi
+/// use optimize::Qp;
+///
+/// // min x^2 + y^2 - 2x - 5y with x + 2y <= 3 (Q = 2 I).
+/// let qp = Qp::new([[2, 0], [0, 2]], [-2.0, -5.0]).le([[1, 2]], [3.0]);
+/// let r = try optimize::quadprog(qp);
+/// assert(r.success() && (r.x[0] - 0.4).abs() < 1e-7 && (r.x[1] - 1.3).abs() < 1e-7);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Qp {
+    pub(pkg) lp: Lp;
+}
+
+impl Qp {
+    /// Minimize `x^T q x / 2 + c^T x` over free `x`.
+    ///
+    /// ```nabi
+    /// let r = try optimize::quadprog(optimize::Qp::new([[1]], [-3.0]));
+    /// assert((r.x[0] - 3.0).abs() < 1e-8);
+    /// ```
+    pub fn new(q: Matrix<f64>, c: Vector<f64>) -> Qp {
+        let lp = Lp::new(c).bounds(Bounds::free(c.len()));
+        lp.q = q.copy();
+        Qp { lp }
+    }
+
+    /// With the rows `a x <= b`.
+    ///
+    /// ```nabi
+    /// let qp = optimize::Qp::new([[1]], [-3.0]).le([[1]], [1.0]);
+    /// assert(((try optimize::quadprog(qp)).x[0] - 1.0).abs() < 1e-8);
+    /// ```
+    pub fn le(self, a: Matrix<f64>, b: Vector<f64>) -> Qp { Qp { lp: self.lp.le(a, b) } }
+
+    /// With the rows `a x >= b`.
+    ///
+    /// ```nabi
+    /// let qp = optimize::Qp::new([[1]], [3.0]).ge([[1]], [1.0]);
+    /// assert(((try optimize::quadprog(qp)).x[0] - 1.0).abs() < 1e-8);
+    /// ```
+    pub fn ge(self, a: Matrix<f64>, b: Vector<f64>) -> Qp { Qp { lp: self.lp.ge(a, b) } }
+
+    /// With the rows `a x = b`.
+    ///
+    /// ```nabi
+    /// let qp = optimize::Qp::new([[1, 0], [0, 1]], [0.0, 0.0]).eq([[1, 1]], [2.0]);
+    /// assert(((try optimize::quadprog(qp)).x[0] - 1.0).abs() < 1e-8);
+    /// ```
+    pub fn eq(self, a: Matrix<f64>, b: Vector<f64>) -> Qp { Qp { lp: self.lp.eq(a, b) } }
+
+    /// With the box `b`.
+    ///
+    /// ```nabi
+    /// let qp = optimize::Qp::new([[1]], [-3.0]).bounds(try optimize::Bounds::uniform(1, 0.0, 2.0));
+    /// assert(((try optimize::quadprog(qp)).x[0] - 2.0).abs() < 1e-7);
+    /// ```
+    pub fn bounds(self, b: Bounds) -> Qp { Qp { lp: self.lp.bounds(b) } }
+}
+
+/// The solution of an `Lp` or `Qp`.
+///
+/// ```nabi
+/// let r = try optimize::linprog(optimize::Lp::new([1.0]).ge([[1]], [1.0]));
+/// assert(r.success() && r.slack.len() == 1 && r.slack[0] == 0.0);
+/// ```
+#[derive(Clone, Debug)]
+pub struct LpSolution {
+    /// The solution (for `Infeasible` or `Unbounded`, the last point).
+    pub x: Vector<f64>;
+    /// The objective at `x`.
+    pub fun: f64;
+    /// `b_ub - A_ub x` for the `le` / `ge` rows (in the `<=` form).
+    pub slack: Vector<f64>;
+    /// `b_eq - A_eq x`.
+    pub residual: Vector<f64>;
+    /// `Converged`, `Infeasible`, `Unbounded` or `MaxIterations`.
+    pub status: Status;
+    /// Pivots (simplex) or iterations (interior point).
+    pub iterations: usize;
+    /// `status` in words.
+    pub message: str;
+}
+
+impl LpSolution {
+    /// Whether an optimum was found.
+    ///
+    /// ```nabi
+    /// let lp = optimize::Lp::new([1.0]).le([[1]], [-1.0]);    // x <= -1 and x >= 0
+    /// let r = try optimize::linprog(lp);
+    /// assert(!r.success() && r.status == optimize::Status::Infeasible);
+    /// ```
+    pub fn success(self) -> bool { self.status == Status::Converged }
+}
+
+impl Display for LpSolution {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        try f.write_str(f"{self.message}: f = {self.fun} at x = {self.x:?} after {self.iterations} iterations")
+    }
+}
+
+/// One original variable as columns of the standard form: `x = shift
+/// + sum sign * x'[col]`.
+pub(pkg) struct Var {
+    pub(pkg) shift: f64;
+    pub(pkg) cols: List<(usize, f64)>;
+}
+
+/// The standard form `min c^T x + x^T q x / 2, a x = b, x >= 0`, with
+/// the map back.
+pub(pkg) struct Standard {
+    pub(pkg) a: Matrix<f64>;
+    pub(pkg) b: Vector<f64>;
+    pub(pkg) c: Vector<f64>;
+    pub(pkg) q: Matrix<f64>;
+    pub(pkg) quad: bool;
+    pub(pkg) offset: f64;
+    pub(pkg) vars: List<Var>;
+    /// Columns of the slacks of the `<=` rows, in order.
+    pub(pkg) slack0: usize;
+    pub(pkg) nub: usize;
+}
+
+pub(pkg) fn standard(p: Lp) -> Standard {
+    let n = p.c.len();
+    let quad = p.q.len() > 0;
+    let vars: List<Var> = [];
+    let ncol = 0;
+    // Finite upper bounds of shifted variables become rows x' <= hi - lo.
+    let caps: List<(usize, f64)> = [];
+    for i in 0..n {
+        let (lo, hi) = (p.lo[i], p.hi[i]);
+        if lo > -f64::INFINITY {
+            vars.push(Var { shift: lo, cols: [(ncol, 1.0)] });
+            if hi < f64::INFINITY { caps.push((ncol, hi - lo)); }
+            ncol += 1;
+        } else if hi < f64::INFINITY {
+            vars.push(Var { shift: hi, cols: [(ncol, -1.0)] });
+            ncol += 1;
+        } else {
+            vars.push(Var { shift: 0.0, cols: [(ncol, 1.0), (ncol + 1, -1.0)] });
+            ncol += 2;
+        }
+    }
+    let nub = p.aub.len() + caps.len();
+    let neq = p.aeq.len();
+    let m = nub + neq;
+    let nt = ncol + nub;
+    let a: Matrix<f64> = Array::zeros([m, nt]);
+    let b: Vector<f64> = Array::zeros([m]);
+    let shift: Vector<f64> = Array::from_fn([n], |ix: [usize; 1]| -> f64 { vars[ix[0]].shift });
+    let row = 0;
+    for r in 0..p.aub.len() {
+        let ar = p.aub[r];
+        let s = p.bub[r];
+        for i in 0..n {
+            let v = ar[i];
+            if v == 0.0 { continue; }
+            s -= v * shift[i];
+            for (cidx, sg) in vars[i].cols { a[row, cidx] += sg * v; }
+        }
+        b[row] = s;
+        a[row, ncol + row] = 1.0;
+        row += 1;
+    }
+    for (cidx, cap) in caps {
+        a[row, cidx] = 1.0;
+        b[row] = cap;
+        a[row, ncol + row] = 1.0;
+        row += 1;
+    }
+    for r in 0..neq {
+        let ar = p.aeq[r];
+        let s = p.beq[r];
+        for i in 0..n {
+            let v = ar[i];
+            if v == 0.0 { continue; }
+            s -= v * shift[i];
+            for (cidx, sg) in vars[i].cols { a[row, cidx] += sg * v; }
+        }
+        b[row] = s;
+        row += 1;
+    }
+    // Objective: c^T (shift + T x') + (shift + T x')^T Q (shift + T x') / 2.
+    let lin = p.c.copy();
+    let offset = 0.0;
+    for i in 0..n { offset += p.c[i] * shift[i]; }
+    let q: Matrix<f64> = Array::zeros([if quad { nt } else { 0 }, if quad { nt } else { 0 }]);
+    if quad {
+        let qs = p.q @ shift;
+        for i in 0..n {
+            lin[i] += qs[i];
+            offset += 0.5 * shift[i] * qs[i];
+        }
+        for i in 0..n {
+            for j in 0..n {
+                let v = p.q[i, j];
+                if v == 0.0 { continue; }
+                for (ci, si) in vars[i].cols {
+                    for (cj, sj) in vars[j].cols { q[ci, cj] += si * sj * v; }
+                }
+            }
+        }
+    }
+    let c: Vector<f64> = Array::zeros([nt]);
+    for i in 0..n {
+        for (cidx, sg) in vars[i].cols { c[cidx] += sg * lin[i]; }
+    }
+    Standard { a, b, c, q, quad, offset, vars, slack0: ncol, nub: p.aub.len() }
+}
+
+/// The original variables from a standard-form point.
+pub(pkg) fn recover(s: Standard, z: Vector<f64>) -> Vector<f64> {
+    let n = s.vars.len();
+    let x: Vector<f64> = Array::zeros([n]);
+    for i in 0..n {
+        let v = s.vars[i].shift;
+        for (cidx, sg) in s.vars[i].cols { v += sg * z[cidx]; }
+        x[i] = v;
+    }
+    x
+}
+
+/// The solution record for the original problem at `x`.
+pub(pkg) fn solution(p: Lp, x: Vector<f64>, status: Status, iterations: usize, method: str) -> LpSolution {
+    let n = x.len();
+    let fun = 0.0;
+    for i in 0..n { fun += p.c[i] * x[i]; }
+    if p.q.len() > 0 {
+        let qx = p.q @ x;
+        for i in 0..n { fun += 0.5 * x[i] * qx[i]; }
+    }
+    let slack: Vector<f64> = Array::zeros([p.aub.len()]);
+    for r in 0..p.aub.len() {
+        let s = p.bub[r];
+        for i in 0..n { s -= p.aub[r][i] * x[i]; }
+        slack[r] = s;
+    }
+    let res: Vector<f64> = Array::zeros([p.aeq.len()]);
+    for r in 0..p.aeq.len() {
+        let s = p.beq[r];
+        for i in 0..n { s -= p.aeq[r][i] * x[i]; }
+        res[r] = s;
+    }
+    LpSolution { x, fun, slack, residual: res, status, iterations, message: f"{method}: {status}" }
+}
+
+/// Solves a linear program by the simplex method (default) or the
+/// interior-point method (which hands a problem it cannot finish,
+/// typically an infeasible or unbounded one, to the simplex method).
+///
+/// ```nabi
+/// use optimize::Lp;
+///
+/// // A diet problem: two foods, two nutrients, cheapest mix.
+/// let lp = Lp::new([0.6, 0.35]).ge([[5, 7], [4, 2]], [8.0, 15.0]);
+/// let r = try optimize::linprog(lp);
+/// assert(r.success() && (r.x[0] - 3.75).abs() < 1e-12);
+/// ```
+pub fn linprog(lp: Lp, method: LpMethod = LpMethod::Simplex, max_iter: usize = 0, tol: f64 = 1e-9) throws (OptimizeError) -> LpSolution {
+    try lp.check();
+    if lp.q.len() > 0 { throw OptimizeError::BadOption { what: "the problem has a quadratic term; solve it with `quadprog`" }; }
+    let s = standard(lp);
+    match method {
+        LpMethod::Simplex => {
+            let (z, st, it) = simplex::solve(s, max_iter, tol);
+            solution(lp, recover(s, z), st, it, "simplex")
+        }
+        LpMethod::InteriorPoint => {
+            let (z, st, it) = ipm::solve(s, max_iter, tol);
+            if st == Status::Converged || st == Status::Infeasible || st == Status::Unbounded { return solution(lp, recover(s, z), st, it, "interior point"); }
+            // The iterates of an infeasible or unbounded problem need not
+            // diverge fast; the simplex method settles which it is.
+            let (zs, sts, its) = simplex::solve(s, max_iter, tol);
+            solution(lp, recover(s, zs), sts, it + its, "interior point, finished by simplex")
+        }
+    }
+}
+
+/// Solves a convex quadratic program by the interior-point method.
+/// `Q` must be symmetric positive semidefinite (an indefinite `Q`
+/// gives a stationary point, or `NotFinite` / `MaxIterations`).
+///
+/// ```nabi
+/// use optimize::Qp;
+///
+/// // Least distance: the point of x + y = 1, x, y >= 0 nearest (1, 1).
+/// let qp = Qp::new([[2, 0], [0, 2]], [-2.0, -2.0]).eq([[1, 1]], [1.0]).bounds(try optimize::Bounds::uniform(2, 0.0, 1.0));
+/// let r = try optimize::quadprog(qp);
+/// assert((r.x[0] - 0.5).abs() < 1e-7);
+/// ```
+pub fn quadprog(qp: Qp, max_iter: usize = 0, tol: f64 = 1e-9) throws (OptimizeError) -> LpSolution {
+    let lp = qp.lp;
+    try lp.check();
+    let n = lp.c.len();
+    if lp.q.shape() != [n, n] { throw shape(f"Q is {lp.q.shape()[0]} x {lp.q.shape()[1]}, c has {n} elements"); }
+    for i in 0..n {
+        for j in 0..n {
+            if !lp.q[i, j].is_finite() { throw OptimizeError::NotFinite { what: "Q" }; }
+            if (lp.q[i, j] - lp.q[j, i]).abs() > 1e-12 * (lp.q[i, j].abs() + lp.q[j, i].abs()) { throw OptimizeError::BadOption { what: f"Q is not symmetric (Q[{i}, {j}] != Q[{j}, {i}]); pass (Q + Q^T) / 2" }; }
+        }
+    }
+    let s = standard(lp);
+    let (z, st, it) = ipm::solve(s, max_iter, tol);
+    solution(lp, recover(s, z), st, it, "interior point")
+}

@@ -1,0 +1,79 @@
+// Truncated Newton (line-search Newton-CG, Nocedal and Wright 2006,
+// Algorithm 7.1): each step solves H p = -g by conjugate gradients only
+// to the forcing tolerance min(0.5, sqrt(||g||)) ||g||, which gives
+// superlinear convergence, and stops CG at negative curvature. It needs
+// only Hessian-vector products: given (`with_hessp`), from a given
+// Hessian, or a forward difference of the gradient.
+
+use pkg::IntoObjective;
+use pkg::error::OptimizeError;
+use pkg::line::search;
+use pkg::minimize::{done, flat, report, start, tiny};
+use pkg::objective::{dot, inf_norm, norm};
+use pkg::result::{Minimum, Options, Status};
+use core::array::{Array, Vector};
+use linalg::AsVector;
+
+const EPS: f64 = 2.220446049250313e-16;
+
+/// Newton-CG: a line-search Newton method whose step comes from a few
+/// CG iterations on `H p = -g` with Hessian-vector products. Fast near
+/// a minimum and cheap in memory; give `with_hessp` (or `with_hess`)
+/// when you can, otherwise each product costs a gradient.
+///
+/// ```nabi
+/// use core::array::{Array, Vector};
+///
+/// let x0: Vector<f64> = Array::full([50], 0.5);
+/// let m = try optimize::newton_cg(optimize::problems::rosenbrock(), x0);
+/// assert(m.success() && m.fun < 1e-10);
+/// ```
+pub fn newton_cg<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    let (ev, x, fx, g) = try start(f.into_objective(), x0, true);
+    let n = x.len();
+    let iters = opts.iters(n, 200);
+    let k = 0;
+    let status = Status::MaxIterations;
+    if inf_norm(g) <= opts.gtol { return done(ev, x, fx, g, Status::Converged, 0, "Newton-CG"); }
+    while k < iters {
+        let gn = norm(g);
+        let tol = gn.sqrt().min(0.5) * gn;
+        let z: Vector<f64> = Array::zeros([n]);
+        let r = g.copy();
+        let d = g .* -1.0;
+        let rr = dot(r, r);
+        for j in 0..20 * n {
+            let bd = ev.hv(x, g, d);
+            let curv = dot(d, bd);
+            if curv <= 3.0 * EPS * dot(d, d) {
+                // Negative or no curvature: stop here; on the first
+                // iteration step along -g, scaled by the curvature when
+                // there is some.
+                if j == 0 { z = if curv < 0.0 { d .* (rr / -curv) } else { g .* (-1.0 / gn.max(1.0)) }; }
+                break;
+            }
+            let a = rr / curv;
+            z .+= a .* d;
+            r .+= a .* bd;
+            let rr_new = dot(r, r);
+            if rr_new.sqrt() < tol { break; }
+            d .= (rr_new / rr) .* d .- r;
+            rr = rr_new;
+        }
+        let ls = search(opts.line_search, ref ev, x, fx, g, z, 1.0, 1e10, 1e-4, 0.9);
+        if !ls.ok { status = Status::LineSearchFailed; break; }
+        let s = ls.x .- x;
+        let f_old = fx;
+        x = ls.x;
+        fx = ls.f;
+        g = ls.g;
+        k += 1;
+        if !fx.is_finite() { status = Status::NotFinite; break; }
+        if report(opts, k, x, fx, g) { status = Status::Stopped; break; }
+        if inf_norm(g) <= opts.gtol || flat(f_old, fx, opts.ftol) { status = Status::Converged; break; }
+        if tiny(s, x, opts.xtol) { status = Status::Stalled; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+    }
+    done(ev, x, fx, g, status, k, "Newton-CG")
+}

@@ -1,0 +1,288 @@
+// L-BFGS-B (Byrd, Lu, Nocedal and Zhu 1995): limited-memory BFGS on a
+// box. The Hessian estimate is the compact form B = theta I - W M W^T,
+// W = [Y, theta S]. Each iteration finds the generalized Cauchy point
+// along the projected steepest descent path (the breakpoints in order),
+// minimizes the model over the variables still free there (direct
+// primal method, Sherman-Morrison-Woodbury on the 2m x 2m middle
+// matrix), truncates that step to the box, then runs a More-Thuente
+// line search capped at the box.
+
+use pkg::IntoObjective;
+use pkg::bound::{Bounds, pgrad};
+use pkg::error::OptimizeError;
+use pkg::line::LineSearch;
+use pkg::line::search;
+use pkg::minimize::{done, flat, report, start, tiny};
+use pkg::objective::{dot, inf_norm, norm};
+use pkg::result::{Minimum, Options, Status};
+use core::array::{Array, Matrix, Vector};
+use linalg::AsVector;
+
+const EPS: f64 = 2.220446049250313e-16;
+
+/// The limited-memory state: the pairs, theta and the middle matrix.
+struct Memory {
+    s: List<Vector<f64>>;
+    y: List<Vector<f64>>;
+    theta: f64;
+    m: Matrix<f64>;
+}
+
+impl Memory {
+    fn len(self) -> usize { self.s.len() }
+
+    /// Row `i` of W = [Y, theta S].
+    fn w(self, i: usize) -> Vector<f64> {
+        let k = self.s.len();
+        let r: Vector<f64> = Array::zeros([2 * k]);
+        for j in 0..k {
+            r[j] = self.y[j][i];
+            r[k + j] = self.theta * self.s[j][i];
+        }
+        r
+    }
+
+    /// Rebuilds M = [[-D, L^T], [L, theta S^T S]]^-1; false when it is
+    /// singular.
+    fn rebuild(ref self) -> bool {
+        let k = self.s.len();
+        if k == 0 {
+            self.m = Array::zeros([0, 0]);
+            return true;
+        }
+        let a: Matrix<f64> = Array::zeros([2 * k, 2 * k]);
+        for i in 0..k {
+            a[i, i] = -dot(self.s[i], self.y[i]);
+            for j in 0..k {
+                if i > j {
+                    let l = dot(self.s[i], self.y[j]);
+                    a[k + i, j] = l;
+                    a[j, k + i] = l;
+                }
+                a[k + i, k + j] = self.theta * dot(self.s[i], self.s[j]);
+            }
+        }
+        let inv = try? linalg::inv(a);
+        match inv {
+            none => false,
+            m: Matrix<f64> => {
+                self.m = m;
+                true
+            }
+        }
+    }
+
+    fn clear(ref self) {
+        self.s.clear();
+        self.y.clear();
+        self.theta = 1.0;
+        self.m = Array::zeros([0, 0]);
+    }
+}
+
+fn mvec(m: Matrix<f64>, v: Vector<f64>) -> Vector<f64> {
+    if v.len() == 0 { return v; }
+    m @ v
+}
+
+/// The generalized Cauchy point and `c = W^T (xcp - x)`.
+fn cauchy(x: Vector<f64>, g: Vector<f64>, b: Bounds, mem: Memory) -> (Vector<f64>, Vector<f64>) {
+    let n = x.len();
+    let k2 = 2 * mem.len();
+    let theta = mem.theta;
+    let d: Vector<f64> = Array::zeros([n]);
+    let brk: List<(f64, usize)> = [];
+    for i in 0..n {
+        let t = if g[i] < 0.0 { (x[i] - b.hi[i]) / g[i] } else if g[i] > 0.0 { (x[i] - b.lo[i]) / g[i] } else { f64::INFINITY };
+        if t > 0.0 && g[i] != 0.0 {
+            d[i] = -g[i];
+            brk.push((t, i));
+        }
+    }
+    brk.sort_by(|p, q| p.0.total_cmp(q.0));
+    let p: Vector<f64> = Array::zeros([k2]);
+    let kk = mem.len();
+    for j in 0..kk {
+        p[j] = dot(mem.y[j], d);
+        p[kk + j] = theta * dot(mem.s[j], d);
+    }
+    let c: Vector<f64> = Array::zeros([k2]);
+    let fp = -dot(d, d);
+    let fpp0 = -theta * fp;
+    let fpp = fpp0 - dot(p, mvec(mem.m, p));
+    let dtmin = -fp / fpp;
+    let told = 0.0;
+    let xcp = x.copy();
+    let idx = 0;
+    while idx < brk.len() {
+        let (t, i) = brk[idx];
+        let dt = t - told;
+        if dtmin < dt { break; }
+        xcp[i] = if d[i] > 0.0 { b.hi[i] } else { b.lo[i] };
+        let zb = xcp[i] - x[i];
+        c .+= dt .* p;
+        let gb = g[i];
+        let wb = mem.w(i);
+        let mc = mvec(mem.m, c);
+        let mp = mvec(mem.m, p);
+        let mw = mvec(mem.m, wb);
+        fp += dt * fpp + gb * gb + theta * gb * zb - gb * dot(wb, mc);
+        fpp -= theta * gb * gb + 2.0 * gb * dot(wb, mp) + gb * gb * dot(wb, mw);
+        fpp = fpp.max(EPS * fpp0);
+        p .+= gb .* wb;
+        d[i] = 0.0;
+        dtmin = -fp / fpp;
+        told = t;
+        idx += 1;
+    }
+    dtmin = dtmin.max(0.0);
+    told += dtmin;
+    for j in idx..brk.len() {
+        let i = brk[j].1;
+        xcp[i] = x[i] + told * d[i];
+    }
+    c .+= dtmin .* p;
+    (xcp, c)
+}
+
+/// Minimizes the model over the variables free at `xcp`, truncated to
+/// the box.
+fn subspace(x: Vector<f64>, g: Vector<f64>, xcp: Vector<f64>, c: Vector<f64>, b: Bounds, mem: Memory) -> Vector<f64> {
+    let n = x.len();
+    let theta = mem.theta;
+    let k2 = 2 * mem.len();
+    let free: List<usize> = [];
+    for i in 0..n {
+        if xcp[i] > b.lo[i] && xcp[i] < b.hi[i] { free.push(i); }
+    }
+    if free.len() == 0 { return xcp; }
+    let mc = mvec(mem.m, c);
+    let r: List<f64> = List::with_capacity(free.len());
+    let rows: List<Vector<f64>> = List::with_capacity(free.len());
+    let wz: Vector<f64> = Array::zeros([k2]);
+    let ww: Matrix<f64> = Array::zeros([k2, k2]);
+    for i in free {
+        let wi = mem.w(i);
+        let ri = g[i] + theta * (xcp[i] - x[i]) - dot(wi, mc);
+        r.push(ri);
+        rows.push(wi);
+        wz .+= ri .* wi;
+        for a in 0..k2 {
+            if wi[a] != 0.0 { ww[a] .+= wi[a] .* wi; }
+        }
+    }
+    let v: Vector<f64> = Array::zeros([k2]);
+    if k2 > 0 {
+        let rhs = mem.m @ wz;
+        let nmat = linalg::eye::<f64>(k2) .- (mem.m @ ww) .* (1.0 / theta);
+        let sol = try? linalg::solve(nmat, rhs);
+        match sol {
+            none => { return xcp; }
+            s: Vector<f64> => { v = s; }
+        }
+    }
+    let du: List<f64> = List::with_capacity(free.len());
+    for j in 0..free.len() {
+        du.push(-r[j] / theta - (if k2 > 0 { dot(rows[j], v) } else { 0.0 }) / (theta * theta));
+    }
+    let alpha = 1.0;
+    for j in 0..free.len() {
+        let i = free[j];
+        if du[j] > 0.0 { alpha = alpha.min((b.hi[i] - xcp[i]) / du[j]); } else if du[j] < 0.0 { alpha = alpha.min((b.lo[i] - xcp[i]) / du[j]); }
+    }
+    let xb = xcp.copy();
+    for j in 0..free.len() {
+        let i = free[j];
+        xb[i] = xcp[i] + alpha * du[j];
+    }
+    xb
+}
+
+/// The largest step along `d` from `x` that stays in the box.
+pub(pkg) fn max_step(x: Vector<f64>, d: Vector<f64>, b: Bounds) -> f64 {
+    let s = f64::INFINITY;
+    for i in 0..x.len() {
+        if d[i] > 0.0 { s = s.min((b.hi[i] - x[i]) / d[i]); } else if d[i] < 0.0 { s = s.min((b.lo[i] - x[i]) / d[i]); }
+    }
+    s
+}
+
+/// L-BFGS-B: L-BFGS on box constraints `bounds` (Byrd, Lu, Nocedal
+/// and Zhu). `x0` is projected into the box first. Stops when the
+/// projected gradient `||P(x - g) - x||_inf <= gtol` or the relative
+/// decrease of `f` falls below `ftol`. `opts.memory` pairs are kept;
+/// `opts.line_search` is ignored (it is always More-Thuente, capped at
+/// the box).
+///
+/// ```nabi
+/// use optimize::Bounds;
+///
+/// // The minimum of Rosenbrock with x[0] <= 0.5 is on that bound.
+/// let b = try Bounds::new([-2.0, -2.0], [0.5, 2.0]);
+/// let m = try optimize::lbfgsb(optimize::problems::rosenbrock(), [-1.2, 1.0], b);
+/// assert(m.success() && m.x[0] == 0.5 && (m.x[1] - 0.25).abs() < 1e-5);
+/// ```
+pub fn lbfgsb<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, bounds: Bounds, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    try bounds.fits(x0.len());
+    if opts.memory == 0 { throw OptimizeError::BadOption { what: "memory is 0; keep at least 1 pair (3 to 20 is usual)" }; }
+    let (ev, x, fx, g) = try start(f.into_objective(), bounds.project(x0), true);
+    let n = x.len();
+    let iters = opts.iters(n, 200);
+    let mem = Memory { s: [], y: [], theta: 1.0, m: Array::zeros([0, 0]) };
+    let k = 0;
+    let status = Status::MaxIterations;
+    let name = "L-BFGS-B";
+    if inf_norm(pgrad(bounds, x, g)) <= opts.gtol { return done(ev, x, fx, g, Status::Converged, 0, name); }
+    while k < iters {
+        let (xcp, c) = cauchy(x, g, bounds, mem);
+        let xb = if mem.len() == 0 { xcp } else { subspace(x, g, xcp, c, bounds, mem) };
+        let d = xb .- x;
+        if !(dot(d, g) < 0.0) {
+            if mem.len() > 0 {
+                mem.clear();
+                continue;
+            }
+            // Only rounding is left.
+            status = Status::Converged;
+            break;
+        }
+        let smax = max_step(x, d, bounds);
+        let a0 = if mem.len() == 0 { (1.0 / norm(d)).min(smax).min(1.0) } else { 1.0f64.min(smax) };
+        let ls = search(LineSearch::MoreThuente, ref ev, x, fx, g, d, a0, smax, 1e-3, 0.9);
+        if !ls.ok {
+            if mem.len() > 0 {
+                mem.clear();
+                continue;
+            }
+            status = Status::LineSearchFailed;
+            break;
+        }
+        let xn = bounds.project(ls.x);
+        let s = xn .- x;
+        let y = ls.g .- g;
+        let f_old = fx;
+        x = xn;
+        fx = ls.f;
+        g = ls.g;
+        k += 1;
+        if !fx.is_finite() { status = Status::NotFinite; break; }
+        if report(opts, k, x, fx, g) { status = Status::Stopped; break; }
+        if inf_norm(pgrad(bounds, x, g)) <= opts.gtol || flat(f_old, fx, opts.ftol) { status = Status::Converged; break; }
+        if tiny(s, x, opts.xtol) { status = Status::Stalled; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+        let sy = dot(s, y);
+        let yy = dot(y, y);
+        if sy > EPS * yy {
+            if mem.len() == opts.memory {
+                _ = mem.s.remove(0);
+                _ = mem.y.remove(0);
+            }
+            mem.s.push(s);
+            mem.y.push(y);
+            mem.theta = yy / sy;
+            if !mem.rebuild() { mem.clear(); }
+        }
+    }
+    done(ev, x, fx, g, status, k, name)
+}

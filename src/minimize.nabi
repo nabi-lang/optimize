@@ -1,0 +1,136 @@
+// Unconstrained minimization of f: R^n -> R. Each method is a function
+// (`bfgs`, `nelder_mead`, ...); `minimize` picks one by `Method` and
+// adds bounds and constraints.
+pub mod cg;
+pub mod nelder;
+pub mod newton;
+pub mod powell;
+pub mod quasi;
+pub mod trust;
+
+use pkg::IntoObjective;
+use pkg::error::{OptimizeError, finite};
+use pkg::objective::{Eval, Objective, inf_norm};
+use pkg::result::{Minimum, Options, Status, Step};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// Checks `x0` and evaluates `f` and its gradient there.
+pub(pkg) fn start(o: Objective, x0: Vector<f64>, grad: bool) throws (OptimizeError) -> (Eval, Vector<f64>, f64, Vector<f64>) {
+    if x0.len() == 0 { throw OptimizeError::Empty; }
+    try finite(x0, "x0");
+    let ev = Eval::of(o);
+    let x = x0.copy();
+    if grad {
+        let (f, g) = ev.fg(x);
+        if !f.is_finite() { throw OptimizeError::NotFinite { what: "f(x0)" }; }
+        try finite(g, "the gradient at x0");
+        (ev, x, f, g)
+    } else {
+        let f = ev.f(x);
+        if !f.is_finite() { throw OptimizeError::NotFinite { what: "f(x0)" }; }
+        (ev, x, f, Vector::<f64>::from(List::new()))
+    }
+}
+
+/// Calls the callback; `true` to stop.
+pub(pkg) fn report(opts: Options, k: usize, x: Vector<f64>, f: f64, g: Vector<f64>) -> bool {
+    let gn = if g.len() == 0 { f64::NAN } else { inf_norm(g) };
+    opts.stop(Step { iteration: k, x, fun: f, gnorm: gn })
+}
+
+/// The result of a run.
+pub(pkg) fn done(ev: Eval, x: Vector<f64>, f: f64, g: Vector<f64>, status: Status, k: usize, method: str) -> Minimum {
+    Minimum { x, fun: f, grad: g, status, iterations: k, nfev: ev.nfev, ngev: ev.ngev, nhev: ev.nhev, message: f"{method}: {status}" }
+}
+
+/// Whether `f` fell by less than `ftol * max(1, |f|)`.
+pub(pkg) fn flat(f_old: f64, f: f64, ftol: f64) -> bool { (f_old - f).abs() <= ftol * f.abs().max(1.0) }
+
+/// Whether the step `s` is below `xtol * (1 + ||x||)` in every element.
+pub(pkg) fn tiny(s: Vector<f64>, x: Vector<f64>, xtol: f64) -> bool { inf_norm(s) <= xtol * (1.0 + inf_norm(x)) }
+
+/// A method for `minimize`.
+///
+/// ```nabi
+/// use optimize::Method;
+///
+/// let m = try optimize::minimize(optimize::problems::rosenbrock(), [-1.2, 1.0], method: Method::NewtonCg);
+/// assert(m.success());
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Method {
+    /// `nelder_mead`: values only.
+    NelderMead,
+    /// `powell`: values only.
+    Powell,
+    /// `cg` with Polak-Ribiere+.
+    Cg,
+    /// `bfgs`, the default without bounds or constraints.
+    Bfgs,
+    /// `lbfgs`.
+    Lbfgs,
+    /// `newton_cg`.
+    NewtonCg,
+    /// `trust_dogleg`.
+    TrustDogleg,
+    /// `trust_ncg`.
+    TrustNcg,
+    /// `lbfgsb`, the default with bounds.
+    LbfgsB,
+    /// `projected_gradient` (bounds).
+    ProjectedGradient,
+    /// `auglag`, the default with constraints.
+    AugLag,
+}
+
+/// Minimizes `f` from `x0` with `method`, or the default for the
+/// problem: BFGS without bounds or constraints, L-BFGS-B with bounds,
+/// the augmented Lagrangian with constraints. The methods' own
+/// functions (`bfgs`, `lbfgsb`, ...) take the same arguments and some
+/// more.
+///
+/// ```nabi
+/// use optimize::{Bounds, Constraint};
+/// use core::array::Vector;
+///
+/// let f = optimize::problems::rosenbrock();
+/// assert((try optimize::minimize(f, [-1.2, 1.0])).success());
+/// let b = try Bounds::uniform(2, -0.5, 0.5);
+/// let m = try optimize::minimize(f, [0.0, 0.0], bounds: b);
+/// assert(m.x ∈ b && m.x[0] == 0.5);
+/// let disk = Constraint::le(|x: Vector<f64>| -> f64 { x[0] ** 2 + x[1] ** 2 }, 1.0);
+/// let c = try optimize::minimize(f, [0.0, 0.0], constraints: [disk]);
+/// assert((c.x[0] - 0.7864).abs() < 1e-3);
+/// ```
+pub fn minimize<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, method: Method? = none, bounds: pkg::Bounds? = none, constraints: List<pkg::Constraint> = [], opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    let cons = constraints;
+    let has_b = bounds != none;
+    let has_c = cons.len() > 0;
+    let m = match method {
+        none => if has_c { Method::AugLag } else if has_b { Method::LbfgsB } else { Method::Bfgs },
+        mm: Method => mm,
+    };
+    if has_c && m != Method::AugLag { throw OptimizeError::BadOption { what: f"{m:?} takes no constraints; use `Method::AugLag`, or leave `method` out" }; }
+    if has_b && m != Method::LbfgsB && m != Method::ProjectedGradient && m != Method::AugLag { throw OptimizeError::BadOption { what: f"{m:?} takes no bounds; use `Method::LbfgsB` or `Method::ProjectedGradient`, or leave `method` out" }; }
+    let o = f.into_objective();
+    let b = match bounds { none => pkg::Bounds::free(x0.len()), bb: pkg::Bounds => bb };
+    match m {
+        Method::NelderMead => try nelder::nelder_mead(o, x0, opts: opts),
+        Method::Powell => try powell::powell(o, x0, opts),
+        Method::Cg => try cg::cg(o, x0, opts: opts),
+        Method::Bfgs => try quasi::bfgs(o, x0, opts),
+        Method::Lbfgs => try quasi::lbfgs(o, x0, opts),
+        Method::NewtonCg => try newton::newton_cg(o, x0, opts),
+        Method::TrustDogleg => try trust::trust_dogleg(o, x0, opts: opts),
+        Method::TrustNcg => try trust::trust_ncg(o, x0, opts: opts),
+        Method::LbfgsB => try pkg::bound::lbfgsb::lbfgsb(o, x0, b, opts),
+        Method::ProjectedGradient => try pkg::bound::projected::projected_gradient(o, x0, b, opts),
+        Method::AugLag => {
+            let r = try pkg::constrained::auglag(o, x0, cons, bounds: b, opts: opts);
+            let g = o.gradient(r.x);
+            Minimum { x: r.x, fun: r.fun, grad: g, status: r.status, iterations: r.iterations, nfev: r.nfev, ngev: 0, nhev: 0, message: f"{r.message} (violation {r.violation})" }
+        }
+    }
+}

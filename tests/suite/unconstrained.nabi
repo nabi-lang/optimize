@@ -1,0 +1,142 @@
+// The More-Garbow-Hillstrom set through every unconstrained method, with
+// the gradient by AD: each must reach the known minimum value from the
+// paper's start. Freudenstein-Roth has a local minimum (48.98) that
+// every method finds from that start; the misses listed in `allowed`
+// are known weak spots of the method, not bugs.
+
+use pkg::tests::suite::mgh::{all, sumsq};
+use pkg::tests::suite::{close, expect};
+use pkg::{Conjugate, LineSearch, Minimum, Objective, Options, Status};
+use core::array::{Array, Matrix, Vector};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+const METHODS: [str; 9] = ["bfgs", "lbfgs", "cg", "cg-fr", "newton-cg", "dogleg", "trust-ncg", "nelder-mead", "powell"];
+
+fn run(k: usize, o: Objective, x0: Vector<f64>) -> Minimum {
+    match k {
+        0 => try! pkg::bfgs(o, x0),
+        1 => try! pkg::lbfgs(o, x0),
+        2 => try! pkg::cg(o, x0),
+        3 => try! pkg::cg(o, x0, Conjugate::FletcherReeves),
+        4 => try! pkg::newton_cg(o, x0),
+        5 => try! pkg::trust_dogleg(o, x0),
+        6 => try! pkg::trust_ncg(o, x0),
+        7 => try! pkg::nelder_mead(o, x0, opts: Options { max_iter: 20000 }),
+        _ => try! pkg::powell(o, x0),
+    }
+}
+
+/// Method and problem pairs that stop early (on the flat-f test, or in
+/// a local minimum of their own).
+fn allowed(m: str, p: str) -> bool {
+    let pairs = [
+        ("cg", "brown badly scaled"), ("cg-fr", "brown badly scaled"),
+        ("cg", "powell badly scaled"), ("cg-fr", "powell badly scaled"),
+        ("newton-cg", "powell badly scaled"), ("trust-ncg", "powell badly scaled"),
+        ("nelder-mead", "box 3-d"),
+    ];
+    for (a, b) in pairs {
+        if a == m && b == p { return true; }
+    }
+    false
+}
+
+#[test]
+fn mgh_set_every_method() {
+    let misses: List<str> = [];
+    for p in all() {
+        let o = Objective::dual(sumsq(p.r));
+        for k in 0..METHODS.len() {
+            let r = run(k, o, p.x0);
+            let tol = 1e-6 * p.fmin.max(1.0);
+            let ok = r.fun <= p.fmin + tol || (p.alt == p.alt && (r.fun - p.alt).abs() <= 1e-6 * p.alt);
+            if !ok && !allowed(METHODS[k], p.name) { misses.push(f"{METHODS[k]} on {p.name}: f = {r.fun} ({r.status}), want {p.fmin}"); }
+            expect(r.fun.is_finite() && r.x.len() == p.x0.len(), f"{METHODS[k]} on {p.name} gives a finite point");
+        }
+    }
+    expect(misses.len() == 0, f"misses: {misses:?}");
+}
+
+#[test]
+fn rosenbrock_minimizer_and_gradient() {
+    for k in 0..7 {
+        let r = run(k, pkg::problems::rosenbrock(), [-1.2, 1.0]);
+        expect(r.success(), f"{METHODS[k]}: {r.message}");
+        close(r.x[0], 1.0, 1e-4, f"{METHODS[k]} x0");
+        close(r.x[1], 1.0, 2e-4, f"{METHODS[k]} x1");
+        expect(r.grad.len() == 2, "gradient returned");
+    }
+}
+
+#[test]
+fn line_searches_all_converge() {
+    for ls in [LineSearch::MoreThuente, LineSearch::StrongWolfe, LineSearch::Backtracking] {
+        let o = Options { line_search: ls };
+        let a = try! pkg::bfgs(pkg::problems::rosenbrock(), [-1.2, 1.0], o);
+        let b = try! pkg::lbfgs(pkg::problems::rosenbrock(), [-1.2, 1.0], o);
+        expect(a.success() && b.success(), f"{ls:?}: {a.message} / {b.message}");
+        expect(a.fun < 1e-12 && b.fun < 1e-12, f"{ls:?} minimum");
+    }
+}
+
+#[test]
+fn large_rosenbrock() {
+    let x0: Vector<f64> = Array::full([200], -1.0);
+    for k in [1, 4, 6] {
+        let r = run(k, pkg::problems::rosenbrock(), x0);
+        expect(r.success() && r.fun < 1e-10, f"{METHODS[k]} n = 200: {r.message}");
+    }
+    let c = try! pkg::cg(pkg::problems::rosenbrock(), x0, opts: Options { max_iter: 20000 });
+    expect(c.fun < 1e-8, f"cg n = 200: {c.message}");
+}
+
+#[test]
+fn quadratic_property() {
+    // f = (x - c)^T A (x - c) / 2 with A = B B^T + I, seeded: every
+    // gradient method finds c.
+    let g = Xoshiro256PlusPlus::seed(42);
+    for trial in 0..5 {
+        let n = 3 + trial;
+        let b: List<f64> = List::with_capacity(n * n);
+        for _ in 0..n * n { b.push(g.uniform(-1.0, 1.0)); }
+        let bm: Matrix<f64> = Array::from_list(b, [n, n]);
+        let a = (try! linalg::matmul(bm, bm.t())) .+ linalg::eye::<f64>(n);
+        let c: Vector<f64> = Array::from_fn([n], |i: [usize; 1]| -> f64 { (i[0] as f64) - 1.5 });
+        let f = |x: Vector<f64>| -> f64 {
+            let d = x .- c;
+            0.5 * (try! linalg::dot(d, try! linalg::matvec(a, d)))
+        };
+        let gr = |x: Vector<f64>| -> Vector<f64> { try! linalg::matvec(a, x .- c) };
+        let o = Objective::new(f).with_grad(gr).with_hess(|_x: Vector<f64>| -> Matrix<f64> { a });
+        let x0: Vector<f64> = Array::zeros([n]);
+        for k in 0..7 {
+            let r = run(k, o, x0);
+            for i in 0..n { close(r.x[i], c[i], 1e-5, f"{METHODS[k]} quadratic n = {n} x[{i}]"); }
+        }
+    }
+}
+
+#[test]
+fn callback_and_limits() {
+    let seen = [0];
+    let o = Options { callback: |s: pkg::Step| -> bool { seen[0] = s.iteration; s.iteration >= 5 } };
+    let r = try! pkg::bfgs(pkg::problems::rosenbrock(), [-1.2, 1.0], o);
+    expect(r.status == Status::Stopped && r.iterations == 5 && seen[0] == 5, f"stopped at 5: {r.message}");
+    let m = try! pkg::bfgs(pkg::problems::rosenbrock(), [-1.2, 1.0], Options { max_iter: 3 });
+    expect(m.status == Status::MaxIterations && m.iterations == 3, "max_iter");
+    let e = try! pkg::lbfgs(pkg::problems::rosenbrock(), [-1.2, 1.0], Options { max_eval: 10 });
+    expect(e.status == Status::MaxEvaluations, f"max_eval: {e.message}");
+    let nm = try! pkg::nelder_mead(pkg::problems::rosen::<f64>, [-1.2, 1.0], opts: Options { max_iter: 10 });
+    expect(nm.status == Status::MaxIterations, "nelder-mead max_iter");
+}
+
+#[test]
+fn minimize_dispatch() {
+    let f = pkg::problems::rosenbrock();
+    for m in [pkg::Method::NelderMead, pkg::Method::Powell, pkg::Method::Cg, pkg::Method::Bfgs, pkg::Method::Lbfgs, pkg::Method::NewtonCg, pkg::Method::TrustDogleg, pkg::Method::TrustNcg, pkg::Method::LbfgsB, pkg::Method::ProjectedGradient, pkg::Method::AugLag] {
+        let o = if m == pkg::Method::TrustDogleg { Objective::new(pkg::problems::rosen::<f64>).with_grad(pkg::problems::rosen_grad).with_hess(pkg::problems::rosen_hess) } else { pkg::problems::rosenbrock() };
+        let r = try! pkg::minimize(o, [-1.2, 1.0], method: m, opts: Options { max_iter: 20000 });
+        expect(r.fun < 1e-8, f"{m:?}: {r.message}");
+    }
+    _ = f;
+}

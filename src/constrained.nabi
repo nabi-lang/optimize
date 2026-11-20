@@ -1,0 +1,282 @@
+// Nonlinear constraints and the augmented Lagrangian method
+// (Powell-Hestenes-Rockafellar; Nocedal and Wright 2006, 17.3 and 17.4;
+// Birgin and Martinez 2014). Each outer iteration minimizes
+//
+//   L(x) = f(x) + sum_eq (l c + mu c^2 / 2)
+//              + sum_le (max(0, l + mu c)^2 - l^2) / (2 mu)
+//
+// with L-BFGS-B over the bounds, then updates the multipliers (l <- l
+// + mu c, clipped at 0 for inequalities) and raises mu tenfold when the
+// violation did not fall to a quarter.
+
+use pkg::IntoObjective;
+use pkg::bound::Bounds;
+use pkg::bound::lbfgsb::lbfgsb;
+use pkg::error::OptimizeError;
+use pkg::objective::{Objective, inf_norm};
+use pkg::result::{Options, Status};
+use core::array::{Array, Vector};
+use linalg::AsVector;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(pkg) enum Kind {
+    Eq,
+    Le,
+}
+
+/// A nonlinear constraint `c(x) <= b`, `c(x) >= b` or `c(x) = b` on a
+/// scalar function `c` (any `IntoObjective`: a closure over `f64`,
+/// `Dual` or `Complex<f64>`, or an `Objective` with its gradient).
+/// The operators `c ⩽ b`, `c ⩾ b` and `c ≐ b` of `optimize::ops` build
+/// the same.
+///
+/// ```nabi
+/// use optimize::Constraint;
+/// use core::array::Vector;
+///
+/// let c = Constraint::le(|x: Vector<f64>| -> f64 { x[0] + x[1] }, 1.0);
+/// assert(c.violation([0.75, 0.75]) == 0.5);
+/// assert(c.violation([0.25, 0.25]) == 0.0);
+/// ```
+pub struct Constraint {
+    pub(pkg) kind: Kind;
+    pub(pkg) c: Objective;
+    pub(pkg) sign: f64;
+    pub(pkg) rhs: f64;
+}
+
+impl Constraint {
+    /// `c(x) <= b`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let c = optimize::Constraint::le(|x: Vector<f64>| -> f64 { x[0] }, 2.0);
+    /// assert(c.violation([3.0]) == 1.0);
+    /// ```
+    pub fn le<F: IntoObjective>(c: F, b: f64) -> Constraint { Constraint { kind: Kind::Le, c: c.into_objective(), sign: 1.0, rhs: b } }
+
+    /// `c(x) >= b`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let c = optimize::Constraint::ge(|x: Vector<f64>| -> f64 { x[0] }, 2.0);
+    /// assert(c.violation([1.5]) == 0.5);
+    /// ```
+    pub fn ge<F: IntoObjective>(c: F, b: f64) -> Constraint { Constraint { kind: Kind::Le, c: c.into_objective(), sign: -1.0, rhs: b } }
+
+    /// `c(x) = b`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let c = optimize::Constraint::eq(|x: Vector<f64>| -> f64 { x[0] * x[1] }, 1.0);
+    /// assert(c.violation([2.0, 1.0]) == 1.0);
+    /// ```
+    pub fn eq<F: IntoObjective>(c: F, b: f64) -> Constraint { Constraint { kind: Kind::Eq, c: c.into_objective(), sign: 1.0, rhs: b } }
+
+    /// The constraint in the form `h(x) <= 0` or `h(x) = 0`.
+    pub(pkg) fn h(self, x: Vector<f64>) -> f64 { self.sign * (self.c.value(x) - self.rhs) }
+
+    pub(pkg) fn dh(self, x: Vector<f64>) -> Vector<f64> { self.c.gradient(x) .* self.sign }
+
+    /// How far `x` is from satisfying it: `max(0, c(x) - b)` for `<=`,
+    /// `|c(x) - b|` for `=`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let c = optimize::Constraint::eq(|x: Vector<f64>| -> f64 { x[0] }, 1.0);
+    /// assert(c.violation([0.0]) == 1.0);
+    /// ```
+    pub fn violation(self, x: Vector<f64>) -> f64 {
+        let h = self.h(x);
+        match self.kind {
+            Kind::Eq => h.abs(),
+            Kind::Le => h.max(0.0),
+        }
+    }
+
+    /// Whether `x` satisfies it within `tol`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let c = optimize::Constraint::ge(|x: Vector<f64>| -> f64 { x[0] }, 0.0);
+    /// assert(c.holds([0.0], 0.0));
+    /// ```
+    pub fn holds(self, x: Vector<f64>, tol: f64 = 1e-8) -> bool { self.violation(x) <= tol }
+}
+
+/// The largest violation of `cons` at `x`.
+pub(pkg) fn violation(cons: List<Constraint>, x: Vector<f64>) -> f64 {
+    let v = 0.0;
+    for c in cons { v = v.max(c.violation(x)); }
+    v
+}
+
+/// The result of a constrained minimization: the minimum, the
+/// Lagrange multipliers and the largest constraint violation at `x`.
+/// There is one multiplier per constraint, in order, for the
+/// constraint written as `h(x) <= 0` or `h(x) = 0` with `h = c - b`
+/// (`b - c` for `>=`), so that `grad f + sum l grad h = 0`; those of
+/// the inequalities are `>= 0`.
+///
+/// ```nabi
+/// use optimize::Constraint;
+/// use core::array::Vector;
+///
+/// let f = |x: Vector<f64>| -> f64 { x[0] ** 2 + x[1] ** 2 };
+/// let on_line = Constraint::eq(|x: Vector<f64>| -> f64 { x[0] + x[1] }, 1.0);
+/// let r = try optimize::auglag(f, [0.0, 0.0], [on_line]);
+/// assert(r.success() && (r.x[0] - 0.5).abs() < 1e-6 && r.violation < 1e-8);
+/// assert((r.multipliers[0] + 1.0).abs() < 1e-5);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Constrained {
+    /// The point.
+    pub x: Vector<f64>;
+    /// `f(x)`.
+    pub fun: f64;
+    /// The Lagrange multipliers.
+    pub multipliers: Vector<f64>;
+    /// The largest constraint violation at `x`.
+    pub violation: f64;
+    /// Why the run stopped.
+    pub status: Status;
+    /// Outer (multiplier) iterations.
+    pub iterations: usize;
+    /// Inner iterations, summed.
+    pub inner: usize;
+    /// Evaluations of `f` (the constraints' are not counted).
+    pub nfev: usize;
+    /// `status` in words.
+    pub message: str;
+}
+
+impl Constrained {
+    /// Whether it converged with the constraints met.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let r = try optimize::auglag(|x: Vector<f64>| -> f64 { x[0] ** 2 }, [1.0], []);
+    /// assert(r.success());
+    /// ```
+    pub fn success(self) -> bool { self.status == Status::Converged }
+}
+
+impl Display for Constrained {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        try f.write_str(f"{self.message}: f = {self.fun} at x = {self.x:?}, violation {self.violation}, after {self.iterations} outer and {self.inner} inner iterations")
+    }
+}
+
+/// Minimizes `f` subject to `cons` (and the box `bounds`) by the
+/// augmented Lagrangian method with L-BFGS-B inside. Converges when the
+/// largest violation is below `ctol` and the inner problem converged
+/// with the multipliers settled. Works with any smooth `f` and
+/// constraints; give gradients (or write them over `Dual`) for speed.
+///
+/// ```nabi
+/// use optimize::Constraint;
+/// use core::array::Vector;
+///
+/// // Hock-Schittkowski 71.
+/// let f = |x: Vector<f64>| -> f64 { x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2] };
+/// let prod = Constraint::ge(|x: Vector<f64>| -> f64 { x[0] * x[1] * x[2] * x[3] }, 25.0);
+/// let sq = Constraint::eq(|x: Vector<f64>| -> f64 { x[0] ** 2 + x[1] ** 2 + x[2] ** 2 + x[3] ** 2 }, 40.0);
+/// let b = try optimize::Bounds::uniform(4, 1.0, 5.0);
+/// let r = try optimize::auglag(f, [1.0, 5.0, 5.0, 1.0], [prod, sq], bounds: b);
+/// assert(r.success() && (r.fun - 17.0140173).abs() < 1e-5);
+/// ```
+pub fn auglag<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, cons: List<Constraint>, bounds: Bounds? = none, ctol: f64 = 1e-8, opts: Options = Options {}) throws (OptimizeError) -> Constrained {
+    let x0: Vector<f64> = x0.as_vector();
+    let n = x0.len();
+    if n == 0 { throw OptimizeError::Empty; }
+    if !(ctol > 0.0) { throw OptimizeError::BadOption { what: f"ctol = {ctol}; it must be > 0" }; }
+    let b = match bounds { none => Bounds::free(n), bb: Bounds => bb };
+    try b.fits(n);
+    let o = f.into_objective();
+    let m = cons.len();
+    let lam: Vector<f64> = Array::zeros([m]);
+    let x = b.project(x0);
+    let mu = 10.0;
+    let viol = violation(cons, x);
+    let inner = 0;
+    let nfev = 0;
+    let status = Status::MaxIterations;
+    let fx = o.value(x);
+    let outer = 0;
+    let max_outer = if opts.max_iter == 0 { 100 } else { opts.max_iter };
+    let gtol = opts.gtol;
+    for k in 1..=max_outer {
+        outer = k;
+        let l = lam.copy();
+        let mk = mu;
+        let lval = |y: Vector<f64>| -> f64 {
+            let s = o.value(y);
+            for i in 0..m {
+                let h = cons[i].h(y);
+                match cons[i].kind {
+                    Kind::Eq => { s += l[i] * h + 0.5 * mk * h * h; }
+                    Kind::Le => {
+                        let t = (l[i] + mk * h).max(0.0);
+                        s += (t * t - l[i] * l[i]) / (2.0 * mk);
+                    }
+                }
+            }
+            s
+        };
+        let lgrad = |y: Vector<f64>| -> (f64, Vector<f64>) {
+            let s = o.value(y);
+            let g = o.gradient(y);
+            for i in 0..m {
+                let h = cons[i].h(y);
+                let w = match cons[i].kind {
+                    Kind::Eq => {
+                        s += l[i] * h + 0.5 * mk * h * h;
+                        l[i] + mk * h
+                    }
+                    Kind::Le => {
+                        let t = (l[i] + mk * h).max(0.0);
+                        s += (t * t - l[i] * l[i]) / (2.0 * mk);
+                        t
+                    }
+                };
+                if w != 0.0 { g .+= w .* cons[i].dh(y); }
+            }
+            (s, g)
+        };
+        let sub = Objective::new(lval).with_value_grad(lgrad);
+        let r = try lbfgsb(sub, x, b, Options { gtol, ftol: opts.ftol, max_iter: opts.max_iter, memory: opts.memory });
+        inner += r.iterations;
+        nfev += r.nfev;
+        x = r.x;
+        fx = o.value(x);
+        let v = violation(cons, x);
+        // First-order multiplier update.
+        let moved = 0.0;
+        for i in 0..m {
+            let h = cons[i].h(x);
+            let nl = match cons[i].kind { Kind::Eq => lam[i] + mu * h, Kind::Le => (lam[i] + mu * h).max(0.0) };
+            moved = moved.max((nl - lam[i]).abs());
+            lam[i] = nl;
+        }
+        if opts.stop(pkg::result::Step { iteration: k, x, fun: fx, gnorm: inf_norm(r.grad) }) { status = Status::Stopped; break; }
+        let settled = moved <= ctol.sqrt() * (1.0 + inf_norm(lam));
+        if v <= ctol && (r.success() || r.status == Status::Stalled) && settled {
+            status = Status::Converged;
+            break;
+        }
+        if v > 0.25 * viol { mu = (10.0 * mu).min(1e12); }
+        viol = v;
+        // Tighten the inner tolerance as the multipliers settle.
+        gtol = (opts.gtol * 1e-2).max(gtol * 0.1).max(1e-12);
+        if !fx.is_finite() { status = Status::NotFinite; break; }
+    }
+    let v = violation(cons, x);
+    if status == Status::MaxIterations && v > ctol { status = Status::Infeasible; }
+    Constrained { x, fun: fx, multipliers: lam, violation: v, status, iterations: outer, inner, nfev, message: f"augmented Lagrangian: {status}" }
+}

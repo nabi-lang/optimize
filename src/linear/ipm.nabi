@@ -1,0 +1,229 @@
+// Mehrotra's predictor-corrector interior-point method on
+//
+//   min c^T z + z^T Q z / 2,  A z = b,  z >= 0
+//
+// Each iteration eliminates ds and dz from the Newton system of the
+// perturbed KKT conditions and solves the normal equations
+// A (Q + Z^-1 S)^-1 A^T dy = r by Cholesky; the affine step sets the
+// centering sigma = (mu_aff / mu)^3, the corrector reuses the factor.
+// For an LP Q is 0 and the Hessian block is diagonal.
+
+use pkg::linear::Standard;
+use pkg::objective::{dot, inf_norm};
+use pkg::result::Status;
+use core::array::{Array, Matrix, Vector};
+
+/// The factorization of one iteration: H = Q + Z^-1 S (diagonal for
+/// an LP) and the normal matrix.
+struct Kkt {
+    a: Matrix<f64>;
+    quad: bool;
+    hd: Vector<f64>;
+    hf: linalg::Cholesky<f64>?;
+    nf: linalg::Cholesky<f64>?;
+    ha: Matrix<f64>;
+    kf: linalg::Lu<f64>?;
+}
+
+impl Kkt {
+    fn hsolve(self, v: Vector<f64>) -> Vector<f64> {
+        if !self.quad { return v ./ self.hd; }
+        match self.hf {
+            none => v ./ self.hd,
+            h: linalg::Cholesky<f64> => try? h.solve(v) ?? v ./ self.hd,
+        }
+    }
+
+    /// Solves for (dz, dy) with right sides `-rd - rc / z` and `-rp`.
+    fn solve(self, r1: Vector<f64>, rp: Vector<f64>) -> (Vector<f64>, Vector<f64>) {
+        let m = rp.len();
+        if m == 0 { return (self.hsolve(r1), Array::zeros([0])); }
+        match self.kf {
+            none => {}
+            k: linalg::Lu<f64> => {
+                let n = r1.len();
+                let rhs: Vector<f64> = Array::zeros([n + m]);
+                for i in 0..n { rhs[i] = r1[i]; }
+                for i in 0..m { rhs[n + i] = -rp[i]; }
+                let sol = try? k.solve(rhs);
+                if sol != none { return (sol[0:n].copy(), sol[n:].copy()); }
+            }
+        }
+        // A H^-1 A^T dy = -rp - A H^-1 r1
+        let hr = self.hsolve(r1);
+        let rhs = (self.a @ hr) .* -1.0 .- rp;
+        let dy: Vector<f64> = match self.nf {
+            none => Array::zeros([m]),
+            f: linalg::Cholesky<f64> => try? f.solve(rhs) ?? Array::zeros([m]),
+        };
+        let dz = self.hsolve(r1 .+ dy @ self.a);
+        // Iterative refinement of A dz = -rp: the normal matrix squares
+        // the conditioning, which D makes huge near the solution.
+        match self.nf {
+            none => {}
+            f: linalg::Cholesky<f64> => {
+                for _ in 0..2 {
+                    let e = (self.a @ dz) .+ rp;
+                    let d = try? f.solve(e .* -1.0);
+                    if d == none { break; }
+                    dy .+= d;
+                    dz .+= self.hsolve(d @ self.a);
+                }
+            }
+        }
+        (dz, dy)
+    }
+}
+
+fn factor(a: Matrix<f64>, q: Matrix<f64>, quad: bool, d: Vector<f64>) -> Kkt {
+    let (m, n) = (a.shape()[0], a.shape()[1]);
+    let hd = d.copy();
+    if quad && m > 0 {
+        // A QP takes the whole KKT matrix [[Q + D, -A^T], [A, 0]] by LU:
+        // the normal equations square a conditioning that D makes huge
+        // near the solution.
+        let k: Matrix<f64> = Array::zeros([n + m, n + m]);
+        for i in 0..n {
+            for j in 0..n { k[i, j] = q[i, j]; }
+            k[i, i] += d[i];
+        }
+        for r in 0..m {
+            for j in 0..n {
+                k[n + r, j] = a[r, j];
+                k[j, n + r] = -a[r, j];
+            }
+        }
+        let kf = try? linalg::lu(k);
+        if kf != none { return Kkt { a, quad, hd, hf: none, nf: none, ha: Array::zeros([0, 0]), kf }; }
+    }
+    let hf: linalg::Cholesky<f64>? = none;
+    let ha: Matrix<f64> = Array::zeros([n, m]);
+    if quad {
+        let h = q.copy();
+        for i in 0..n { h[i, i] += d[i]; }
+        hf = try? linalg::cholesky(h);
+        if hf != none && m > 0 {
+            let at = a.t().copy();
+            ha = try? hf.solve(at) ?? at;
+        }
+    }
+    let nf: linalg::Cholesky<f64>? = none;
+    if m > 0 {
+        let nm: Matrix<f64> = if quad && hf != none { a @ ha } else {
+            let ad = a.copy();
+            for j in 0..n {
+                let w = 1.0 / hd[j];
+                ad[:, j] .*= w;
+            }
+            ad @ a.t()
+        };
+        // Regularize so dependent rows still factor.
+        let big = 0.0;
+        for i in 0..m { big = big.max(nm[i, i].abs()); }
+        let reg = 1e-14 * big.max(1.0);
+        for i in 0..m { nm[i, i] += reg; }
+        nf = try? linalg::cholesky(nm);
+        let k = 0;
+        while nf == none && k < 20 {
+            reg *= 100.0;
+            for i in 0..m { nm[i, i] += reg; }
+            nf = try? linalg::cholesky(nm);
+            k += 1;
+        }
+    }
+    Kkt { a, quad, hd, hf, nf, ha, kf: none }
+}
+
+/// The largest step in [0, 1] keeping `v + a dv > 0`, times 0.995.
+fn step(v: Vector<f64>, dv: Vector<f64>) -> f64 {
+    let a = 1.0;
+    for i in 0..v.len() {
+        if dv[i] < 0.0 { a = a.min(-v[i] / dv[i]); }
+    }
+    a
+}
+
+pub(pkg) fn solve(st: Standard, max_iter: usize, tol: f64) -> (Vector<f64>, Status, usize) {
+    let a = st.a;
+    let (m, n) = (a.shape()[0], a.shape()[1]);
+    let b = st.b;
+    let c = st.c;
+    let q = st.q;
+    let quad = st.quad;
+    let limit = if max_iter == 0 { 200 } else { max_iter };
+    let qz = |z: Vector<f64>| -> Vector<f64> { if quad { q @ z } else { Array::zeros([z.len()]) } };
+    let aty = |y: Vector<f64>| -> Vector<f64> { if m == 0 { Array::zeros([n]) } else { y @ a } };
+    // Mehrotra's starting point for an LP; a QP starts from ones, which
+    // the curvature of Q pulls into place.
+    let z: Vector<f64> = Array::full([n], 1.0);
+    let s: Vector<f64> = Array::full([n], 1.0);
+    let y: Vector<f64> = Array::zeros([m]);
+    if m > 0 && !quad {
+        let k0 = factor(a, q, false, Array::full([n], 1.0));
+        let (z0, _) = k0.solve(Array::zeros([n]), b .* -1.0);
+        let (_, y0) = k0.solve(c .* -1.0, Array::zeros([m]));
+        z = z0;
+        y = y0;
+        s = c .- aty(y);
+        let zmin = 0.0;
+        let smin = 0.0;
+        for i in 0..n {
+            zmin = zmin.min(z[i]);
+            smin = smin.min(s[i]);
+        }
+        let dz = -1.5 * zmin;
+        let ds = -1.5 * smin;
+        z .+= dz;
+        s .+= ds;
+        let zs = dot(z, s);
+        let sz = s.sum();
+        let zz = z.sum();
+        z .+= if sz > 0.0 { 0.5 * zs / sz } else { 1.0 };
+        s .+= if zz > 0.0 { 0.5 * zs / zz } else { 1.0 };
+        for i in 0..n {
+            if !(z[i] > 1e-8) { z[i] = 1.0; }
+            if !(s[i] > 1e-8) { s[i] = 1.0; }
+        }
+    }
+    let bn = 1.0 + inf_norm(b);
+    let cn = 1.0 + inf_norm(c);
+    let nf = n as f64;
+    for k in 0..limit {
+        let rp = if m == 0 { Array::zeros([0]) } else { (a @ z) .- b };
+        let rd = qz(z) .+ c .- aty(y) .- s;
+        let mu = dot(z, s) / nf;
+        let pobj = dot(c, z) + 0.5 * dot(z, qz(z));
+        if inf_norm(rp) <= tol * bn && inf_norm(rd) <= tol * cn && mu <= tol * (1.0 + pobj.abs()) { return (z, Status::Converged, k); }
+        if !mu.is_finite() { return (z, Status::NotFinite, k); }
+        if inf_norm(z) > 1e12 * bn * cn { return (z, Status::Unbounded, k); }
+        if inf_norm(y) > 1e12 * bn * cn { return (z, Status::Infeasible, k); }
+        let kkt = factor(a, q, quad, s ./ z);
+        // Predictor.
+        let rc = z .* s;
+        let (dza, _) = kkt.solve(rd .* -1.0 .- rc ./ z, rp);
+        let dsa = (rc .+ s .* dza) ./ z .* -1.0;
+        let ap = step(z, dza);
+        let ad = step(s, dsa);
+        if quad {
+            ap = ap.min(ad);
+            ad = ap;
+        }
+        let mua = dot(z .+ ap .* dza, s .+ ad .* dsa) / nf;
+        let sigma = (mua / mu) ** 3;
+        // Corrector.
+        let rc2 = z .* s .+ dza .* dsa .- sigma * mu;
+        let (dz, dy) = kkt.solve(rd .* -1.0 .- rc2 ./ z, rp);
+        let ds = (rc2 .+ s .* dz) ./ z .* -1.0;
+        let tp = (0.995 * step(z, dz)).min(1.0);
+        let td = (0.995 * step(s, ds)).min(1.0);
+        if quad {
+            tp = tp.min(td);
+            td = tp;
+        }
+        z .+= tp .* dz;
+        y .+= td .* dy;
+        s .+= td .* ds;
+        if tp < 1e-12 && td < 1e-12 { return (z, Status::Stalled, k + 1); }
+    }
+    (z, Status::MaxIterations, limit)
+}

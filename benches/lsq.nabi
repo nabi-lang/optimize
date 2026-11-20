@@ -1,0 +1,38 @@
+// Levenberg-Marquardt on a 10^4-point fit of y = a e^(-b t) + c with
+// noise, AD Jacobian. One item is one fit.
+
+use pkg::Dual;
+use core::array::{Array, Vector};
+use core::bench::Bench;
+use core::hint::black_box;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn data(m: usize) -> (Vector<f64>, Vector<f64>) {
+    let g = Xoshiro256PlusPlus::seed(3);
+    let t: Vector<f64> = Array::from_fn([m], |i: [usize; 1]| -> f64 { 10.0 * (i[0] as f64) / (m as f64) });
+    let y: Vector<f64> = Array::zeros([m]);
+    for i in 0..m { y[i] = 2.5 * (-1.3 * t[i]).exp() + 0.5 + 0.01 * g.normal(); }
+    (t, y)
+}
+
+#[bench]
+fn lm_fit_10000(b: Bench) {
+    let (t, y) = data(10000);
+    let model = |x: f64, p: Vector<Dual>| -> Dual { p[0] * (p[1] * -x).exp() + p[2] };
+    b.iter(|| try! pkg::curve_fit(model, black_box(t), black_box(y), [1.0, 1.0, 0.0]));
+}
+
+#[bench]
+fn lm_fit_10000_forward_diff(b: Bench) {
+    let (t, y) = data(10000);
+    let model = |x: f64, p: Vector<f64>| -> f64 { p[0] * (-p[1] * x).exp() + p[2] };
+    b.iter(|| try! pkg::curve_fit(model, black_box(t), black_box(y), [1.0, 1.0, 0.0]));
+}
+
+#[bench]
+fn trf_fit_10000_bounded(b: Bench) {
+    let (t, y) = data(10000);
+    let model = |x: f64, p: Vector<Dual>| -> Dual { p[0] * (p[1] * -x).exp() + p[2] };
+    let bounds = try! pkg::Bounds::new([0.0, 0.0, -1.0], [10.0, 10.0, 1.0]);
+    b.iter(|| try! pkg::curve_fit(model, black_box(t), black_box(y), [1.0, 1.0, 0.0], bounds: bounds));
+}

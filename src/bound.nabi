@@ -1,0 +1,139 @@
+// Box constraints lo <= x <= hi and the solvers that keep to them.
+
+pub mod lbfgsb;
+pub mod projected;
+
+use pkg::error::OptimizeError;
+use core::array::{Array, Vector};
+
+/// Box constraints `lo[i] <= x[i] <= hi[i]`; an infinite bound is no
+/// bound. `x ∈ b` tests a point.
+///
+/// ```nabi
+/// use optimize::Bounds;
+/// use core::array::Vector;
+///
+/// let b = try Bounds::new([0.0, -1.0], [1.0, f64::INFINITY]);
+/// let x: Vector<f64> = [0.5, 7.0];
+/// assert(x ∈ b);
+/// assert(b.project([2.0, -3.0])[0] == 1.0);
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bounds {
+    /// The lower bounds.
+    pub lo: Vector<f64>;
+    /// The upper bounds.
+    pub hi: Vector<f64>;
+}
+
+impl Bounds {
+    /// From the lower and upper bounds; throws when the lengths differ,
+    /// a bound is NaN, or `lo[i] > hi[i]`.
+    ///
+    /// ```nabi
+    /// use optimize::Bounds;
+    ///
+    /// assert((try? Bounds::new([1.0], [0.0])) == none);
+    /// ```
+    pub fn new(lo: Vector<f64>, hi: Vector<f64>) throws (OptimizeError) -> Bounds {
+        if lo.len() != hi.len() { throw OptimizeError::ShapeMismatch { what: f"lo has {lo.len()} elements, hi {hi.len()}" }; }
+        for i in 0..lo.len() {
+            if lo[i] != lo[i] || hi[i] != hi[i] { throw OptimizeError::NotFinite { what: f"bound {i}" }; }
+            if lo[i] > hi[i] { throw OptimizeError::BadBounds { index: i, lo: lo[i], hi: hi[i] }; }
+        }
+        Bounds { lo: lo.copy(), hi: hi.copy() }
+    }
+
+    /// The same interval `[lo, hi]` for each of `n` variables.
+    ///
+    /// ```nabi
+    /// let b = try optimize::Bounds::uniform(3, -1.0, 1.0);
+    /// assert(b.len() == 3 && b.hi[2] == 1.0);
+    /// ```
+    pub fn uniform(n: usize, lo: f64, hi: f64) throws (OptimizeError) -> Bounds {
+        try Bounds::new(Array::full([n], lo), Array::full([n], hi))
+    }
+
+    /// From one inclusive range per variable: `[0.0..=1.0, -2.0..=2.0]`.
+    ///
+    /// ```nabi
+    /// let b = try optimize::Bounds::ranges([0.0..=1.0, -2.0..=2.0]);
+    /// assert(b.lo[1] == -2.0);
+    /// ```
+    pub fn ranges(rs: List<RangeInclusive<f64>>) throws (OptimizeError) -> Bounds {
+        let n = rs.len();
+        let lo: Vector<f64> = Array::zeros([n]);
+        let hi: Vector<f64> = Array::zeros([n]);
+        for i in 0..n {
+            lo[i] = rs[i].start;
+            hi[i] = rs[i].end;
+        }
+        try Bounds::new(lo, hi)
+    }
+
+    /// No bounds on `n` variables.
+    ///
+    /// ```nabi
+    /// assert(optimize::Bounds::free(2).lo[0] == -f64::INFINITY);
+    /// ```
+    pub fn free(n: usize) -> Bounds { Bounds { lo: Array::full([n], -f64::INFINITY), hi: Array::full([n], f64::INFINITY) } }
+
+    /// The number of variables.
+    ///
+    /// ```nabi
+    /// assert(optimize::Bounds::free(4).len() == 4);
+    /// ```
+    pub fn len(self) -> usize { self.lo.len() }
+
+    /// The nearest point of the box to `x`.
+    ///
+    /// ```nabi
+    /// let b = try optimize::Bounds::uniform(2, 0.0, 1.0);
+    /// assert(b.project([-1.0, 0.5])[0] == 0.0);
+    /// ```
+    pub fn project(self, x: Vector<f64>) -> Vector<f64> {
+        let y = x.copy();
+        for i in 0..y.len() { y[i] = y[i].max(self.lo[i]).min(self.hi[i]); }
+        y
+    }
+
+    /// Whether `x` is inside (the same as `x ∈ self`).
+    ///
+    /// ```nabi
+    /// let b = try optimize::Bounds::uniform(1, 0.0, 1.0);
+    /// assert(b.holds([1.0]) && !b.holds([1.5]));
+    /// ```
+    pub fn holds(self, x: Vector<f64>) -> bool {
+        if x.len() != self.lo.len() { return false; }
+        for i in 0..x.len() {
+            if !(x[i] >= self.lo[i] && x[i] <= self.hi[i]) { return false; }
+        }
+        true
+    }
+
+    /// Whether every bound is infinite.
+    pub(pkg) fn open(self) -> bool {
+        for i in 0..self.lo.len() {
+            if self.lo[i] > -f64::INFINITY || self.hi[i] < f64::INFINITY { return false; }
+        }
+        true
+    }
+
+    /// Throws unless the box fits `n` variables.
+    pub(pkg) fn fits(self, n: usize) throws (OptimizeError) {
+        if self.lo.len() != n { throw OptimizeError::ShapeMismatch { what: f"bounds for {self.lo.len()} variables, x0 has {n}" }; }
+    }
+}
+
+impl ops::Contains<core::array::Array<f64, 1>> for Bounds {
+    fn contains(self, x: Vector<f64>) -> bool { self.holds(x) }
+}
+
+/// The projected gradient `P(x - g) - x`, zero exactly at a stationary
+/// point of the box-constrained problem.
+pub(pkg) fn pgrad(b: Bounds, x: Vector<f64>, g: Vector<f64>) -> Vector<f64> {
+    let n = x.len();
+    let p: Vector<f64> = Array::zeros([n]);
+    for i in 0..n { p[i] = (x[i] - g[i]).max(b.lo[i]).min(b.hi[i]) - x[i]; }
+    p
+}

@@ -1,0 +1,25 @@
+// Glue to autodiff's forward and reverse modes: dual and tape-recorded
+// functions as plain ones.
+
+use autodiff::{Dual, Tape, Var};
+use core::array::{Array, Vector};
+
+/// The values of a vector function of dual numbers at plain `x`.
+pub(pkg) fn values(f: fn(Vector<Dual>) -> Vector<Dual>, x: Vector<f64>) -> Vector<f64> {
+    let y = f(autodiff::seed(x, x.len()));
+    let m = y.len();
+    let out: Vector<f64> = Array::zeros([m]);
+    for i in 0..m { out[i] = y[i].re; }
+    out
+}
+
+/// A function of dual numbers as one of plain numbers.
+pub(pkg) fn plain(f: fn(Vector<Dual>) -> Dual) -> fn(Vector<f64>) -> f64 {
+    |x: Vector<f64>| -> f64 { f(autodiff::seed(x, x.len())).re }
+}
+
+/// A function recorded on a tape as one of plain numbers. A fresh tape
+/// per call, so the value costs one recording.
+pub(pkg) fn plain_var(f: fn(Vector<Var>) -> Var) -> fn(Vector<f64>) -> f64 {
+    |x: Vector<f64>| -> f64 { f(Tape::new().vars(x)).value() }
+}

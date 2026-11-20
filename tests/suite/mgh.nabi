@@ -1,0 +1,180 @@
+// Test problems of More, Garbow and Hillstrom (1981), "Testing
+// unconstrained optimization software", as residual vectors over any
+// `Smooth` type: f = sum r_i^2. Starts and minimum values are the
+// paper's.
+
+use pkg::{Dual, Smooth};
+use core::array::{Array, Vector};
+
+pub struct Problem {
+    pub name: str;
+    pub r: fn(Vector<Dual>) -> Vector<Dual>;
+    pub rf: fn(Vector<f64>) -> Vector<f64>;
+    pub x0: Vector<f64>;
+    /// The minimum value of sum r^2.
+    pub fmin: f64;
+    /// A local minimum value solvers may stop at, or NaN.
+    pub alt: f64;
+}
+
+fn vec<T: Smooth>(xs: List<T>) -> Vector<T> {
+    let n = xs.len();
+    Array::view_list(xs, [n])
+}
+
+pub fn rosenbrock<T: Smooth>(x: Vector<T>) -> Vector<T> { vec([(x[1] - x[0] * x[0]) * 10.0, T::of(1.0) - x[0]]) }
+
+pub fn freudenstein_roth<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let a = x[0] - 13.0 + ((T::of(5.0) - x[1]) * x[1] - 2.0) * x[1];
+    let b = x[0] - 29.0 + ((x[1] + 1.0) * x[1] - 14.0) * x[1];
+    vec([a, b])
+}
+
+pub fn powell_badly<T: Smooth>(x: Vector<T>) -> Vector<T> { vec([x[0] * x[1] * 1e4 - 1.0, (-x[0]).exp() + (-x[1]).exp() - 1.0001]) }
+
+pub fn brown_badly<T: Smooth>(x: Vector<T>) -> Vector<T> { vec([x[0] - 1e6, x[1] - 2e-6, x[0] * x[1] - 2.0]) }
+
+pub fn beale<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    vec([T::of(1.5) - x[0] * (T::of(1.0) - x[1]), T::of(2.25) - x[0] * (T::of(1.0) - x[1] * x[1]), T::of(2.625) - x[0] * (T::of(1.0) - x[1] * x[1] * x[1])])
+}
+
+pub fn jennrich_sampson<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let out: List<T> = [];
+    for i in 1..=10 {
+        let t = i as f64;
+        out.push(T::of(2.0 + 2.0 * t) - (x[0] * t).exp() - (x[1] * t).exp());
+    }
+    vec(out)
+}
+
+pub fn helical_valley<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    // theta = atan2(x2, x1) / 2 pi, written with atan for any T: the
+    // start and the minimum have x1 > 0 or are on the axis.
+    let th = if x[0].value() > 0.0 { (x[1] / x[0]).atan() * (0.5 / f64::PI) } else if x[0].value() < 0.0 { (x[1] / x[0]).atan() * (0.5 / f64::PI) + 0.5 } else { T::of(0.25) };
+    let r = (x[0] * x[0] + x[1] * x[1]).sqrt();
+    vec([(x[2] - th * 10.0) * 10.0, (r - 1.0) * 10.0, x[2]])
+}
+
+pub fn box3d<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let out: List<T> = [];
+    for i in 1..=10 {
+        let t = 0.1 * (i as f64);
+        out.push((x[0] * -t).exp() - (x[1] * -t).exp() - x[2] * ((-t).exp() - (-10.0 * t).exp()));
+    }
+    vec(out)
+}
+
+pub fn powell_singular<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let d = x[1] - x[2] * 2.0;
+    let e = x[0] - x[3];
+    vec([x[0] + x[1] * 10.0, (x[2] - x[3]) * 5.0f64.sqrt(), d * d, e * e * 10.0f64.sqrt()])
+}
+
+pub fn wood<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    vec([(x[1] - x[0] * x[0]) * 10.0, T::of(1.0) - x[0], (x[3] - x[2] * x[2]) * 90.0f64.sqrt(), T::of(1.0) - x[2], (x[1] + x[3] - 2.0) * 10.0f64.sqrt(), (x[1] - x[3]) * 0.1f64.sqrt()])
+}
+
+const KO_Y: [f64; 11] = [0.1957, 0.1947, 0.1735, 0.16, 0.0844, 0.0627, 0.0456, 0.0342, 0.0323, 0.0235, 0.0246];
+const KO_U: [f64; 11] = [4.0, 2.0, 1.0, 0.5, 0.25, 0.167, 0.125, 0.1, 0.0833, 0.0714, 0.0625];
+
+pub fn kowalik_osborne<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let out: List<T> = [];
+    for i in 0..11 {
+        let u = KO_U[i];
+        out.push(T::of(KO_Y[i]) - x[0] * (x[1] * u + u * u) / (x[2] * u + x[3] + u * u));
+    }
+    vec(out)
+}
+
+pub fn brown_dennis<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let out: List<T> = [];
+    for i in 1..=20 {
+        let t = (i as f64) / 5.0;
+        let a = x[0] + x[1] * t - t.exp();
+        let b = x[2] + x[3] * t.sin() - t.cos();
+        out.push(a * a + b * b);
+    }
+    vec(out)
+}
+
+pub fn penalty1<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let n = x.len();
+    let out: List<T> = [];
+    let s = T::of(0.0);
+    for i in 0..n {
+        out.push((x[i] - 1.0) * 1e-5f64.sqrt());
+        s = s + x[i] * x[i];
+    }
+    out.push(s - 0.25);
+    vec(out)
+}
+
+pub fn variably<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let n = x.len();
+    let out: List<T> = [];
+    let s = T::of(0.0);
+    for i in 0..n {
+        out.push(x[i] - 1.0);
+        s = s + (x[i] - 1.0) * ((i + 1) as f64);
+    }
+    out.push(s);
+    out.push(s * s);
+    vec(out)
+}
+
+const GAUSS_Y: [f64; 15] = [0.0009, 0.0044, 0.0175, 0.054, 0.1295, 0.2420, 0.3521, 0.3989, 0.3521, 0.2420, 0.1295, 0.054, 0.0175, 0.0044, 0.0009];
+
+pub fn gaussian<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let out: List<T> = [];
+    for i in 0..15 {
+        let d = T::of((7.0 - (i as f64)) / 2.0) - x[2];
+        out.push(x[0] * (x[1] * d * d * -0.5).exp() - GAUSS_Y[i]);
+    }
+    vec(out)
+}
+
+pub fn ext_rosenbrock<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let out: List<T> = [];
+    for k in 0..x.len() / 2 {
+        out.push((x[2 * k + 1] - x[2 * k] * x[2 * k]) * 10.0);
+        out.push(T::of(1.0) - x[2 * k]);
+    }
+    vec(out)
+}
+
+fn p(name: str, r: fn(Vector<Dual>) -> Vector<Dual>, rf: fn(Vector<f64>) -> Vector<f64>, x0: Vector<f64>, fmin: f64) -> Problem { Problem { name, r, rf, x0, fmin, alt: f64::NAN } }
+
+/// The set, with the paper's starts and minimum values.
+pub fn all() -> List<Problem> {
+    let x10: Vector<f64> = Array::from_fn([10], |i: [usize; 1]| -> f64 { if i[0] % 2 == 0 { -1.2 } else { 1.0 } });
+    let pen: Vector<f64> = [1.0, 2.0, 3.0, 4.0];
+    let vd: Vector<f64> = Array::from_fn([10], |i: [usize; 1]| -> f64 { 1.0 - ((i[0] + 1) as f64) / 10.0 });
+    [
+        p("rosenbrock", rosenbrock::<Dual>, rosenbrock::<f64>, [-1.2, 1.0], 0.0),
+        Problem { name: "freudenstein-roth", r: freudenstein_roth::<Dual>, rf: freudenstein_roth::<f64>, x0: [0.5, -2.0], fmin: 0.0, alt: 48.98425367924 },
+        p("powell badly scaled", powell_badly::<Dual>, powell_badly::<f64>, [0.0, 1.0], 0.0),
+        p("brown badly scaled", brown_badly::<Dual>, brown_badly::<f64>, [1.0, 1.0], 0.0),
+        p("beale", beale::<Dual>, beale::<f64>, [1.0, 1.0], 0.0),
+        p("jennrich-sampson", jennrich_sampson::<Dual>, jennrich_sampson::<f64>, [0.3, 0.4], 124.36218235561489),
+        p("helical valley", helical_valley::<Dual>, helical_valley::<f64>, [-1.0, 0.0, 0.0], 0.0),
+        p("box 3-d", box3d::<Dual>, box3d::<f64>, [0.0, 10.0, 20.0], 0.0),
+        p("powell singular", powell_singular::<Dual>, powell_singular::<f64>, [3.0, -1.0, 0.0, 1.0], 0.0),
+        p("wood", wood::<Dual>, wood::<f64>, [-3.0, -1.0, -3.0, -1.0], 0.0),
+        p("kowalik-osborne", kowalik_osborne::<Dual>, kowalik_osborne::<f64>, [0.25, 0.39, 0.415, 0.39], 3.0750560385e-4),
+        p("brown-dennis", brown_dennis::<Dual>, brown_dennis::<f64>, [25.0, 5.0, -5.0, -1.0], 85822.20162635628),
+        p("penalty I", penalty1::<Dual>, penalty1::<f64>, pen, 2.2499775008999e-5),
+        p("variably dimensioned", variably::<Dual>, variably::<f64>, vd, 0.0),
+        p("gaussian", gaussian::<Dual>, gaussian::<f64>, [0.4, 1.0, 0.0], 1.1279327696e-8),
+        p("extended rosenbrock", ext_rosenbrock::<Dual>, ext_rosenbrock::<f64>, x10, 0.0),
+    ]
+}
+
+/// `sum r^2` of a problem as an objective over dual numbers.
+pub fn sumsq(r: fn(Vector<Dual>) -> Vector<Dual>) -> fn(Vector<Dual>) -> Dual {
+    |x: Vector<Dual>| -> Dual {
+        let v = r(x);
+        let s = Dual::constant(0.0);
+        for e in v { s = s + e * e; }
+        s
+    }
+}

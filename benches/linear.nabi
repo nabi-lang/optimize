@@ -1,0 +1,51 @@
+// A dense random LP, 100 rows by 100 variables in [0, 2], feasible by
+// construction; and a 50-variable convex QP. One item is one solve.
+
+use pkg::{Bounds, Lp, LpMethod, Qp};
+use core::array::{Array, Matrix, Vector};
+use core::bench::Bench;
+use core::hint::black_box;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn lp(m: usize, n: usize) -> Lp {
+    let g = Xoshiro256PlusPlus::seed(7);
+    let a: Matrix<f64> = Array::zeros([m, n]);
+    let x0: Vector<f64> = Array::zeros([n]);
+    let c: Vector<f64> = Array::zeros([n]);
+    for j in 0..n {
+        x0[j] = g.uniform(0.0, 1.0);
+        c[j] = g.uniform(-1.0, 1.0);
+    }
+    for i in 0..m {
+        for j in 0..n { a[i, j] = g.uniform(-1.0, 1.0); }
+    }
+    let b = (try! linalg::matvec(a, x0)) .+ 0.5;
+    Lp::new(c).le(a, b).bounds(try! Bounds::uniform(n, 0.0, 2.0))
+}
+
+#[bench]
+fn lp_simplex_100x100(b: Bench) {
+    let p = lp(100, 100);
+    b.iter(|| try! pkg::linprog(black_box(p)));
+}
+
+#[bench]
+fn lp_interior_100x100(b: Bench) {
+    let p = lp(100, 100);
+    b.iter(|| try! pkg::linprog(black_box(p), LpMethod::InteriorPoint));
+}
+
+#[bench]
+fn qp_interior_50(b: Bench) {
+    let g = Xoshiro256PlusPlus::seed(8);
+    let n = 50;
+    let r: Matrix<f64> = Array::zeros([n, n]);
+    for i in 0..n {
+        for j in 0..n { r[i, j] = g.uniform(-1.0, 1.0); }
+    }
+    let q = (try! linalg::matmul(r, r.t())) .+ linalg::eye::<f64>(n);
+    let c: Vector<f64> = Array::from_fn([n], |i: [usize; 1]| -> f64 { (i[0] as f64) / 10.0 - 2.5 });
+    let ones: Matrix<f64> = Array::full([1, n], 1.0);
+    let p = Qp::new(q, c).le(ones, [1.0]).bounds(try! Bounds::uniform(n, -1.0, 1.0));
+    b.iter(|| try! pkg::quadprog(black_box(p)));
+}

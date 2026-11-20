@@ -1,0 +1,305 @@
+// Global minimization: stochastic searches that escape local minima.
+// Differential evolution (Storn and Price 1997; best1bin with dithered
+// mutation, Latin hypercube start, L-BFGS-B polish), basin hopping
+// (Wales and Doye 1997; random jumps between local minima with a
+// Metropolis test and an adaptive step), and simulated annealing
+// (Kirkpatrick et al. 1983 with Szu and Hartley's fast schedule:
+// Cauchy moves, T_k = T_0 / k). Every run is seeded, so the same seed
+// gives the same answer on every target.
+
+use pkg::IntoObjective;
+use pkg::bound::Bounds;
+use pkg::bound::lbfgsb::lbfgsb;
+use pkg::error::{OptimizeError, finite};
+use pkg::minimize::quasi::lbfgs;
+use pkg::objective::Eval;
+use pkg::result::{Minimum, Options, Status, Step};
+use core::array::{Array, Vector};
+use linalg::AsVector;
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn finite_box(b: Bounds) throws (OptimizeError) {
+    if b.len() == 0 { throw OptimizeError::Empty; }
+    for i in 0..b.len() {
+        if !b.lo[i].is_finite() || !b.hi[i].is_finite() { throw OptimizeError::BadOption { what: f"bound {i} is infinite; the global solvers search a finite box, so give finite lo and hi" }; }
+    }
+}
+
+fn result(ev: Eval, x: Vector<f64>, f: f64, status: Status, k: usize, name: str, detail: str) -> Minimum {
+    Minimum { x, fun: f, grad: Vector::<f64>::from([]), status, iterations: k, nfev: ev.nfev, ngev: ev.ngev, nhev: ev.nhev, message: f"{name}: {status}{detail}" }
+}
+
+/// Differential evolution on a finite box: a population of `popsize *
+/// n` points (Latin hypercube start) evolves by `best1bin` (mutant =
+/// best + F (a - b), binomial crossover with probability
+/// `recombination`, F drawn from `mutation` each generation). Stops when
+/// the population's values spread less than `tol * |mean| + atol`,
+/// then polishes the best point with L-BFGS-B (`polish`). Needs only
+/// values of `f`; slow but hard to fool.
+///
+/// ```nabi
+/// use optimize::Bounds;
+///
+/// let b = try Bounds::uniform(2, -5.12, 5.12);
+/// let m = try optimize::differential_evolution(optimize::problems::rastrigin::<f64>, b, seed: 7);
+/// assert(m.success() && m.fun < 1e-8);
+/// ```
+pub fn differential_evolution<F: IntoObjective>(f: F, bounds: Bounds, seed: u64 = 0, popsize: usize = 15, mutation: (f64, f64) = (0.5, 1.0), recombination: f64 = 0.7, tol: f64 = 0.01, atol: f64 = 0.0, max_iter: usize = 1000, polish: bool = true, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    try finite_box(bounds);
+    if popsize < 1 { throw OptimizeError::BadOption { what: "popsize is 0; use at least 1 (15 is usual)" }; }
+    if !(mutation.0 >= 0.0 && mutation.1 <= 2.0 && mutation.0 <= mutation.1) { throw OptimizeError::BadOption { what: f"mutation = {mutation:?}; it must be (lo, hi) with 0 <= lo <= hi <= 2" }; }
+    if !(recombination >= 0.0 && recombination <= 1.0) { throw OptimizeError::BadOption { what: f"recombination = {recombination}; it must be in [0, 1]" }; }
+    let o = f.into_objective();
+    let ev = Eval::of(o);
+    let n = bounds.len();
+    let np = (popsize * n).max(5);
+    let rng = Xoshiro256PlusPlus::seed(seed);
+    let lo = bounds.lo;
+    let width = bounds.hi .- bounds.lo;
+    // Latin hypercube: each variable's np strata in a random order.
+    let pop: List<Vector<f64>> = List::with_capacity(np);
+    for _ in 0..np { pop.push(Array::zeros([n])); }
+    for d in 0..n {
+        let strata: List<usize> = List::from_fn(np, |i| i);
+        rng.shuffle(strata);
+        for i in 0..np { pop[i][d] = lo[d] + width[d] * ((strata[i] as f64) + rng.f64()) / (np as f64); }
+    }
+    let vals: List<f64> = List::with_capacity(np);
+    for i in 0..np { vals.push(ev.f(pop[i])); }
+    let best = 0;
+    for i in 1..np {
+        if vals[i] < vals[best] { best = i; }
+    }
+    let status = Status::MaxIterations;
+    let k = 0;
+    while k < max_iter {
+        k += 1;
+        let fm = rng.uniform(mutation.0, mutation.1);
+        for i in 0..np {
+            let a = rng.below(np as u64) as usize;
+            while a == i { a = rng.below(np as u64) as usize; }
+            let b = rng.below(np as u64) as usize;
+            while b == i || b == a { b = rng.below(np as u64) as usize; }
+            let jr = rng.below(n as u64) as usize;
+            let trial = pop[i].copy();
+            for d in 0..n {
+                if d == jr || rng.f64() < recombination {
+                    let v = pop[best][d] + fm * (pop[a][d] - pop[b][d]);
+                    // Out of the box: a fresh uniform value there.
+                    if !(v >= bounds.lo[d] && v <= bounds.hi[d]) { v = bounds.lo[d] + rng.f64() * width[d]; }
+                    trial[d] = v;
+                }
+            }
+            let ft = ev.f(trial);
+            if ft <= vals[i] || vals[i] != vals[i] {
+                pop[i] = trial;
+                vals[i] = ft;
+                if ft < vals[best] { best = i; }
+            }
+        }
+        let mean = 0.0;
+        for v in vals { mean += v; }
+        mean /= np as f64;
+        let var = 0.0;
+        for v in vals { var += (v - mean) * (v - mean); }
+        let sd = (var / (np as f64)).sqrt();
+        if opts.stop(Step { iteration: k, x: pop[best], fun: vals[best], gnorm: f64::NAN }) { status = Status::Stopped; break; }
+        if sd <= atol + tol * mean.abs() { status = Status::Converged; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+    }
+    let x = pop[best];
+    let fx = vals[best];
+    let detail = "";
+    if polish && status != Status::Stopped {
+        let p = try lbfgsb(o, x, bounds, Options { gtol: opts.gtol });
+        ev.nfev += p.nfev;
+        ev.ngev += p.ngev;
+        if p.fun < fx {
+            x = p.x;
+            fx = p.fun;
+            detail = " (polished by L-BFGS-B)";
+        }
+    }
+    result(ev, x, fx, status, k, "differential evolution", detail)
+}
+
+/// Basin hopping: repeated local minimizations (L-BFGS, or L-BFGS-B
+/// with `bounds`) from random jumps of the last accepted minimum, each
+/// coordinate moved uniformly within `step`; a jump is kept with the
+/// Metropolis probability `exp(-(f_new - f_old) / temperature)`. The
+/// step adapts every 50 hops towards half of them accepted. Returns the
+/// lowest minimum seen; `Converged` once the best has not changed for
+/// `niter_success` hops (when nonzero), else after `niter` hops.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// // A 1-D function with many local minima; the global one is near -0.195.
+/// let f = |x: Vector<f64>| -> f64 { (14.5 * x[0] - 0.3).cos() + (x[0] + 0.2) * x[0] };
+/// let m = try optimize::basin_hopping(f, [1.0], niter: 200, seed: 3);
+/// assert((m.x[0] + 0.195).abs() < 1e-3 && (m.fun + 1.0009).abs() < 1e-4);
+/// ```
+pub fn basin_hopping<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, niter: usize = 100, temperature: f64 = 1.0, step: f64 = 0.5, bounds: Bounds? = none, niter_success: usize = 0, seed: u64 = 0, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    if x0.len() == 0 { throw OptimizeError::Empty; }
+    try finite(x0, "x0");
+    if !(temperature >= 0.0) { throw OptimizeError::BadOption { what: f"temperature = {temperature}; it must be >= 0" }; }
+    if !(step > 0.0) { throw OptimizeError::BadOption { what: f"step = {step}; it must be > 0" }; }
+    let o = f.into_objective();
+    let n = x0.len();
+    // A jump to where f is not finite is a failed hop, not an error.
+    let local = |x: Vector<f64>| -> Minimum? {
+        match bounds {
+            none => try? lbfgs(o, x, Options { gtol: opts.gtol }),
+            b: Bounds => try? lbfgsb(o, x, b, Options { gtol: opts.gtol }),
+        }
+    };
+    match bounds {
+        none => {}
+        b: Bounds => try b.fits(n),
+    }
+    let rng = Xoshiro256PlusPlus::seed(seed);
+    let first = match bounds {
+        none => try lbfgs(o, x0, Options { gtol: opts.gtol }),
+        b: Bounds => try lbfgsb(o, x0, b, Options { gtol: opts.gtol }),
+    };
+    let cur = first;
+    let best = cur;
+    let nfev = cur.nfev;
+    let ngev = cur.ngev;
+    let s = step;
+    let accepted = 0;
+    let since = 0;
+    let status = Status::MaxIterations;
+    let k = 0;
+    while k < niter {
+        k += 1;
+        let y = cur.x.copy();
+        for i in 0..n { y[i] += rng.uniform(-s, s); }
+        match bounds {
+            none => {}
+            b: Bounds => { y = b.project(y); }
+        }
+        let got = local(y);
+        if got == none {
+            since += 1;
+            continue;
+        }
+        let trial = got as Minimum;
+        nfev += trial.nfev;
+        ngev += trial.ngev;
+        let take = trial.fun < cur.fun || (temperature > 0.0 && trial.fun.is_finite() && rng.f64() < (-(trial.fun - cur.fun) / temperature).exp());
+        if take {
+            cur = trial;
+            accepted += 1;
+        }
+        if trial.fun < best.fun - 1e-12 * best.fun.abs().max(1.0) {
+            best = trial;
+            since = 0;
+        } else {
+            since += 1;
+        }
+        if k % 50 == 0 {
+            let rate = (accepted as f64) / 50.0;
+            s = if rate > 0.5 { s / 0.9 } else { s * 0.9 };
+            accepted = 0;
+        }
+        if opts.stop(Step { iteration: k, x: best.x, fun: best.fun, gnorm: f64::NAN }) { status = Status::Stopped; break; }
+        if niter_success > 0 && since >= niter_success { status = Status::Converged; break; }
+        if opts.evals_out(nfev) { status = Status::MaxEvaluations; break; }
+    }
+    if status == Status::MaxIterations && niter_success == 0 { status = Status::Converged; }
+    Minimum { x: best.x, fun: best.fun, grad: best.grad, status, iterations: k, nfev, ngev, nhev: 0, message: f"basin hopping: {status} ({k} hops, best local run: {best.status})" }
+}
+
+/// Simulated annealing on a finite box with the fast schedule: Cauchy
+/// moves of scale `0.2 sqrt(T_k / T_0) (hi - lo)` (reflected into the
+/// box), the temperature `T_k = T_0 / k` with `T_0` from the spread of `f` over
+/// 20 random points, Metropolis acceptance, and a restart from the best
+/// point every `restart` iterations; L-BFGS-B polishes the best point
+/// at the end (`polish`).
+///
+/// ```nabi
+/// use optimize::Bounds;
+///
+/// let b = try Bounds::uniform(2, -5.0, 5.0);
+/// let m = try optimize::simulated_annealing(optimize::problems::himmelblau::<f64>, b, seed: 11);
+/// assert(m.fun < 1e-10);
+/// ```
+pub fn simulated_annealing<F: IntoObjective>(f: F, bounds: Bounds, x0: Vector<f64>? = none, max_iter: usize = 5000, restart: usize = 500, seed: u64 = 0, polish: bool = true, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    try finite_box(bounds);
+    let o = f.into_objective();
+    let ev = Eval::of(o);
+    let n = bounds.len();
+    let rng = Xoshiro256PlusPlus::seed(seed);
+    let width = bounds.hi .- bounds.lo;
+    let rand_point = [ref rng] || -> Vector<f64> {
+        let p: Vector<f64> = Array::zeros([n]);
+        for i in 0..n { p[i] = bounds.lo[i] + rng.f64() * width[i]; }
+        p
+    };
+    let x: Vector<f64> = match x0 {
+        none => rand_point(),
+        v: Vector<f64> => {
+            try bounds.fits(v.len());
+            bounds.project(v)
+        }
+    };
+    let fx = ev.f(x);
+    // T_0 from the spread of f.
+    let samples: List<f64> = [];
+    for _ in 0..20 {
+        let v = ev.f(rand_point());
+        if v.is_finite() { samples.push(v); }
+    }
+    let mean = 0.0;
+    for v in samples { mean += v; }
+    mean /= (samples.len().max(1)) as f64;
+    let var = 0.0;
+    for v in samples { var += (v - mean) * (v - mean); }
+    let t0 = (var / (samples.len().max(1) as f64)).sqrt().max(1e-8);
+    let (bx, bf) = (x.copy(), fx);
+    let status = Status::Converged;
+    let k = 0;
+    while k < max_iter {
+        k += 1;
+        let t = t0 / (k as f64);
+        let scale = 0.2 * (t / t0).sqrt().max(1e-6);
+        let y = x.copy();
+        for i in 0..n {
+            let c = (f64::PI * (rng.f64() - 0.5)).tan() * scale * width[i];
+            let v = y[i] + c;
+            // Reflect into the box, then clamp what is still out.
+            if v < bounds.lo[i] { v = 2.0 * bounds.lo[i] - v; }
+            if v > bounds.hi[i] { v = 2.0 * bounds.hi[i] - v; }
+            y[i] = v.max(bounds.lo[i]).min(bounds.hi[i]);
+        }
+        let fy = ev.f(y);
+        if fy.is_finite() && (fy <= fx || rng.f64() < (-(fy - fx) / t).exp()) {
+            x = y;
+            fx = fy;
+            if fx < bf {
+                bx = x.copy();
+                bf = fx;
+            }
+        }
+        if restart > 0 && k % restart == 0 {
+            x = bx.copy();
+            fx = bf;
+        }
+        if opts.stop(Step { iteration: k, x: bx, fun: bf, gnorm: f64::NAN }) { status = Status::Stopped; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+    }
+    let detail = "";
+    if polish && status != Status::Stopped {
+        let p = try lbfgsb(o, bx, bounds, Options { gtol: opts.gtol });
+        ev.nfev += p.nfev;
+        ev.ngev += p.ngev;
+        if p.fun < bf {
+            bx = p.x;
+            bf = p.fun;
+            detail = " (polished by L-BFGS-B)";
+        }
+    }
+    result(ev, bx, bf, status, k, "simulated annealing", detail)
+}

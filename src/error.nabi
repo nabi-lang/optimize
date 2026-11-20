@@ -1,0 +1,74 @@
+// The one error type of the package: bad input. A run that does not
+// converge is not an error; its result says why in `status`.
+
+use linalg::LinalgError;
+
+/// What was wrong with the input of a call.
+///
+/// ```nabi
+/// use optimize::OptimizeError;
+///
+/// let e = try {
+///     _ = try optimize::brentq(|x: f64| -> f64 { x * x + 1.0 }, -1.0, 1.0);
+///     OptimizeError::Empty
+/// } catch e: OptimizeError { e };
+/// assert(e is OptimizeError::NoSignChange);
+/// assert(f"{e}".contains("bracket_root"));
+/// ```
+#[derive(Clone, PartialEq, Debug)]
+pub enum OptimizeError {
+    /// `f(a)` and `f(b)` have the same sign, so `[a, b]` brackets no
+    /// root.
+    NoSignChange { a: f64; b: f64; fa: f64; fb: f64; },
+    /// A bracket `(a, b, c)` for a minimum is not one: `f(b)` must be
+    /// below `f(a)` and `f(c)` with `b` between them.
+    BadBracket { what: str; },
+    /// Bound `index` has `lo > hi`.
+    BadBounds { index: usize; lo: f64; hi: f64; },
+    /// The operands' shapes do not fit; `what` names them.
+    ShapeMismatch { what: str; },
+    /// The input, or the function at the start, is NaN or infinite.
+    NotFinite { what: str; },
+    /// An option is out of range; `what` names it and the range.
+    BadOption { what: str; },
+    /// A problem with no variables.
+    Empty,
+    /// A linear-algebra step failed on the input (a singular design
+    /// matrix, say).
+    Linalg { what: str; },
+}
+
+impl Display for OptimizeError {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            OptimizeError::NoSignChange { a, b, fa, fb } => f"f({a}) = {fa} and f({b}) = {fb} have the same sign, so [{a}, {b}] brackets no root; widen it with `bracket_root(f, a, b)` or use `newton` / `secant` from a start near the root",
+            OptimizeError::BadBracket { what } => f"not a bracket of a minimum: {what}; let `bracket(f, a, b)` find one",
+            OptimizeError::BadBounds { index, lo, hi } => f"bound {index} has lo = {lo} > hi = {hi}; swap them, or use `Bounds::new` with lo <= hi",
+            OptimizeError::ShapeMismatch { what } => f"shapes do not fit: {what}",
+            OptimizeError::NotFinite { what } => f"{what} is NaN or infinite; start from a point where the function is finite",
+            OptimizeError::BadOption { what } => f"option out of range: {what}",
+            OptimizeError::Empty => "the problem has no variables; pass an x0 with at least one element",
+            OptimizeError::Linalg { what } => f"linear algebra failed: {what}",
+        };
+        try f.write_str(s)
+    }
+}
+
+impl Error for OptimizeError {}
+
+impl From<LinalgError> for OptimizeError {
+    fn from(e: LinalgError) -> OptimizeError { OptimizeError::Linalg { what: f"{e}" } }
+}
+
+/// `ShapeMismatch` with a message.
+pub(pkg) fn shape(what: str) -> OptimizeError { OptimizeError::ShapeMismatch { what } }
+
+/// `BadOption` with a message.
+pub(pkg) fn option(what: str) -> OptimizeError { OptimizeError::BadOption { what } }
+
+/// `NotFinite` unless every element of `x` is finite.
+pub(pkg) fn finite(x: core::array::Vector<f64>, what: str) throws (OptimizeError) {
+    for v in x {
+        if !v.is_finite() { throw OptimizeError::NotFinite { what }; }
+    }
+}

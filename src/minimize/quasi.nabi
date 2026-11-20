@@ -1,0 +1,216 @@
+// Quasi-Newton methods (Nocedal and Wright 2006, chapters 6 and 7):
+// BFGS keeps a dense inverse-Hessian estimate (O(n^2) memory and work
+// per iteration); L-BFGS keeps the last m step pairs and applies them by
+// the two-loop recursion (O(mn)).
+
+use pkg::IntoObjective;
+use pkg::error::OptimizeError;
+use pkg::line::search;
+use pkg::minimize::{done, flat, report, start, tiny};
+use pkg::objective::{dot, inf_norm, norm};
+use pkg::result::{Minimum, Options, Status};
+use core::array::{Array, Vector};
+use linalg::AsVector;
+
+/// BFGS: a quasi-Newton method that builds an estimate of the inverse
+/// Hessian from gradient changes, with a strong Wolfe line search.
+/// Superlinear near a minimum; `O(n^2)` memory and work per iteration,
+/// so for `n` beyond a few thousand use `lbfgs`. Stops when
+/// `||grad||_inf <= gtol`.
+///
+/// ```nabi
+/// let m = try optimize::bfgs(optimize::problems::rosenbrock(), [-1.2, 1.0]);
+/// assert(m.success() && (m.x[0] - 1.0).abs() < 1e-5);
+/// ```
+pub fn bfgs<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    let (ev, x, fx, g) = try start(f.into_objective(), x0, true);
+    let n = x.len();
+    let h = eye(n, 1.0);
+    let iters = opts.iters(n, 200);
+    let k = 0;
+    let status = Status::MaxIterations;
+    let first = true;
+    let reset = false;
+    if inf_norm(g) <= opts.gtol { return done(ev, x, fx, g, Status::Converged, 0, "BFGS"); }
+    while k < iters {
+        let p = hmul(h, g, n) .* -1.0;
+        let d = dot(g, p);
+        if !(d < 0.0) {
+            // The estimate lost positive definiteness to rounding.
+            h = eye(n, 1.0);
+            p = g .* -1.0;
+        }
+        let a0 = if first { (1.0 / inf_norm(g)).min(1.0) } else { 1.0 };
+        let ls = search(opts.line_search, ref ev, x, fx, g, p, a0, 1e10, 1e-4, 0.9);
+        if !ls.ok {
+            if !reset && !first {
+                h = eye(n, 1.0);
+                reset = true;
+                first = true;
+                continue;
+            }
+            status = Status::LineSearchFailed;
+            break;
+        }
+        reset = false;
+        let s = ls.x .- x;
+        let y = ls.g .- g;
+        let f_old = fx;
+        x = ls.x;
+        fx = ls.f;
+        g = ls.g;
+        k += 1;
+        if !fx.is_finite() { status = Status::NotFinite; break; }
+        if report(opts, k, x, fx, g) { status = Status::Stopped; break; }
+        if inf_norm(g) <= opts.gtol || flat(f_old, fx, opts.ftol) { status = Status::Converged; break; }
+        if tiny(s, x, opts.xtol) { status = Status::Stalled; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+        let sy = dot(s, y);
+        if sy > 1e-12 * norm(s) * norm(y) {
+            if first {
+                // Scale the first estimate (Nocedal and Wright 6.20).
+                h = eye(n, sy / dot(y, y));
+            }
+            update(h, s, y, 1.0 / sy, n);
+        }
+        first = false;
+    }
+    done(ev, x, fx, g, status, k, "BFGS")
+}
+
+// The dense estimate is a flat row-major List: List loops are the
+// fastest dense form here (a rank-2 Array row walk costs about 4x and
+// linalg's product copies H in each call).
+
+fn eye(n: usize, d: f64) -> List<f64> {
+    let h: List<f64> = List::from_fn(n * n, |_| 0.0);
+    for i in 0..n { h[i * n + i] = d; }
+    h
+}
+
+fn list(v: Vector<f64>) -> List<f64> { v.as_list() ?? v.to_list() }
+
+/// `H v` for the symmetric `H`, as a sum of rows scaled by `v` (axpy
+/// loops vectorize; a dot product per row is one long dependency chain).
+fn hmul(h: List<f64>, v: Vector<f64>, n: usize) -> Vector<f64> {
+    let vl = list(v);
+    let out: List<f64> = List::from_fn(n, |_| 0.0);
+    for j in 0..n {
+        let c = vl[j];
+        if c == 0.0 { continue; }
+        let off = j * n;
+        for i in 0..n { out[i] += c * h[off + i]; }
+    }
+    Array::view_list(out, [n])
+}
+
+/// `H <- (I - r s y^T) H (I - r y s^T) + r s s^T` as one rank-2 update,
+/// row by row.
+fn update(h: List<f64>, s: Vector<f64>, y: Vector<f64>, r: f64, n: usize) {
+    let hy = hmul(h, y, n);
+    let c = r * r * dot(y, hy) + r;
+    let sl = list(s);
+    let hl = list(hy);
+    for i in 0..n {
+        let a = c * sl[i] - r * hl[i];
+        let b = r * sl[i];
+        let off = i * n;
+        for j in 0..n { h[off + j] += a * sl[j] - b * hl[j]; }
+    }
+}
+
+/// L-BFGS: BFGS with the inverse Hessian kept as the last
+/// `opts.memory` step pairs (two-loop recursion, Nocedal and Wright
+/// Algorithm 7.4). `O(m n)` per iteration, so it handles large `n`.
+///
+/// ```nabi
+/// use core::array::{Array, Vector};
+///
+/// let x0: Vector<f64> = Array::full([100], -1.0);
+/// let m = try optimize::lbfgs(optimize::problems::rosenbrock(), x0);
+/// assert(m.success() && m.fun < 1e-10);
+/// ```
+pub fn lbfgs<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    if opts.memory == 0 { throw OptimizeError::BadOption { what: "memory is 0; keep at least 1 pair (3 to 20 is usual)" }; }
+    let (ev, x, fx, g) = try start(f.into_objective(), x0, true);
+    let n = x.len();
+    let iters = opts.iters(n, 200);
+    let ss: List<Vector<f64>> = [];
+    let ys: List<Vector<f64>> = [];
+    let rs: List<f64> = [];
+    let k = 0;
+    let status = Status::MaxIterations;
+    if inf_norm(g) <= opts.gtol { return done(ev, x, fx, g, Status::Converged, 0, "L-BFGS"); }
+    let reset = false;
+    while k < iters {
+        let p = two_loop(g, ss, ys, rs) .* -1.0;
+        if !(dot(g, p) < 0.0) {
+            ss.clear();
+            ys.clear();
+            rs.clear();
+            p = g .* -1.0;
+        }
+        let a0 = if ss.len() == 0 { (1.0 / inf_norm(g)).min(1.0) } else { 1.0 };
+        let ls = search(opts.line_search, ref ev, x, fx, g, p, a0, 1e10, 1e-4, 0.9);
+        if !ls.ok {
+            if !reset && ss.len() > 0 {
+                ss.clear();
+                ys.clear();
+                rs.clear();
+                reset = true;
+                continue;
+            }
+            status = Status::LineSearchFailed;
+            break;
+        }
+        reset = false;
+        let s = ls.x .- x;
+        let y = ls.g .- g;
+        let f_old = fx;
+        x = ls.x;
+        fx = ls.f;
+        g = ls.g;
+        k += 1;
+        if !fx.is_finite() { status = Status::NotFinite; break; }
+        if report(opts, k, x, fx, g) { status = Status::Stopped; break; }
+        if inf_norm(g) <= opts.gtol || flat(f_old, fx, opts.ftol) { status = Status::Converged; break; }
+        if tiny(s, x, opts.xtol) { status = Status::Stalled; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+        let sy = dot(s, y);
+        if sy > 1e-12 * norm(s) * norm(y) {
+            if ss.len() == opts.memory {
+                _ = ss.remove(0);
+                _ = ys.remove(0);
+                _ = rs.remove(0);
+            }
+            ss.push(s);
+            ys.push(y);
+            rs.push(1.0 / sy);
+        }
+    }
+    done(ev, x, fx, g, status, k, "L-BFGS")
+}
+
+/// `H g` for the L-BFGS estimate with initial `gamma I`, gamma =
+/// `s^T y / y^T y` of the newest pair.
+pub(pkg) fn two_loop(g: Vector<f64>, ss: List<Vector<f64>>, ys: List<Vector<f64>>, rs: List<f64>) -> Vector<f64> {
+    let m = ss.len();
+    let q = g.copy();
+    if m == 0 { return q; }
+    let al: List<f64> = List::from_fn(m, |_| 0.0);
+    for j in 0..m {
+        let i = m - 1 - j;
+        let a = rs[i] * dot(ss[i], q);
+        al[i] = a;
+        q .-= a .* ys[i];
+    }
+    let gamma = dot(ss[m - 1], ys[m - 1]) / dot(ys[m - 1], ys[m - 1]);
+    q .*= gamma;
+    for i in 0..m {
+        let b = rs[i] * dot(ys[i], q);
+        q .+= (al[i] - b) .* ss[i];
+    }
+    q
+}

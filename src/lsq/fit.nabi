@@ -1,0 +1,172 @@
+// curve_fit: weighted least squares of y ~ f(x; p) over the data, with
+// the covariance of the parameters from the Jacobian at the solution,
+// pcov = s^2 (J^T J)^-1 by SVD (singular directions dropped), s^2 the
+// residual variance unless the sigmas are absolute.
+
+use pkg::bound::Bounds;
+use pkg::error::{OptimizeError, finite, shape};
+use pkg::lsq::{LeastSquares, LsqOptions, Residuals, least_squares};
+use pkg::result::Status;
+use autodiff::Dual;
+use core::array::{Array, Matrix, Vector};
+
+const EPS: f64 = 2.220446049250313e-16;
+
+/// A model `y = f(x; p)` for `curve_fit`: a closure `|x: f64, p:
+/// Vector<f64>| -> f64` (Jacobian by differences) or `|x: f64, p:
+/// Vector<Dual>| -> Dual` (exact Jacobian by AD).
+///
+/// ```nabi
+/// use optimize::{Dual, Model};
+/// use core::array::Vector;
+///
+/// let f = |x: f64, p: Vector<Dual>| -> Dual { p[0] * (p[1] * x).exp() };
+/// let r = f.residuals([0.0, 1.0], [1.0, 2.0], [1.0, 1.0]);
+/// assert(r.value([1.0, 0.0])[1] == -1.0);
+/// ```
+pub trait Model {
+    /// The weighted residuals `w_i (f(x_i; p) - y_i)` as a function of
+    /// `p`.
+    fn residuals(self, x: Vector<f64>, y: Vector<f64>, w: Vector<f64>) -> Residuals;
+}
+
+impl Model for fn(f64, Vector<f64>) -> f64 {
+    fn residuals(self, x: Vector<f64>, y: Vector<f64>, w: Vector<f64>) -> Residuals {
+        let f = self;
+        Residuals::new(|p: Vector<f64>| -> Vector<f64> {
+            let m = x.len();
+            let out: Vector<f64> = Array::zeros([m]);
+            for i in 0..m { out[i] = w[i] * (f(x[i], p) - y[i]); }
+            out
+        })
+    }
+}
+
+impl Model for fn(f64, Vector<Dual>) -> Dual {
+    fn residuals(self, x: Vector<f64>, y: Vector<f64>, w: Vector<f64>) -> Residuals {
+        let f = self;
+        Residuals::dual(|p: Vector<Dual>| -> Vector<Dual> {
+            let m = x.len();
+            let out: List<Dual> = List::with_capacity(m);
+            for i in 0..m { out.push((f(x[i], p) - y[i]) * w[i]); }
+            Array::view_list(out, [m])
+        })
+    }
+}
+
+/// A fitted model: the parameters, their covariance and standard
+/// errors, and the fit's residuals.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [0.0, 1.0, 2.0, 3.0];
+/// let y: Vector<f64> = [1.0, 3.1, 4.9, 7.0];
+/// let fit = try optimize::curve_fit(|x: f64, p: Vector<f64>| -> f64 { p[0] + p[1] * x }, x, y, [0.0, 1.0]);
+/// assert((fit.params[1] - 1.98).abs() < 1e-8);
+/// assert(fit.stderr[1] > 0.0 && fit.dof == 2);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Fit {
+    /// The fitted parameters.
+    pub params: Vector<f64>;
+    /// Their covariance matrix (infinite when it cannot be estimated:
+    /// no more data than parameters).
+    pub cov: Matrix<f64>;
+    /// `sqrt(diag(cov))`.
+    pub stderr: Vector<f64>;
+    /// `y - f(x; params)`, unweighted.
+    pub residuals: Vector<f64>;
+    /// The weighted residual sum of squares.
+    pub rss: f64;
+    /// Degrees of freedom, data points minus parameters.
+    pub dof: usize;
+    /// The least-squares run underneath.
+    pub solver: LeastSquares;
+}
+
+impl Fit {
+    /// Whether the solver converged.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let fit = try optimize::curve_fit(|x: f64, p: Vector<f64>| -> f64 { p[0] * x }, [1.0, 2.0], [2.0, 4.0], [1.0]);
+    /// assert(fit.success() && (fit.params[0] - 2.0).abs() < 1e-10);
+    /// ```
+    pub fn success(self) -> bool { self.solver.status == Status::Converged }
+}
+
+/// Fits `y ~ f(x; p)` from `p0` by least squares. `sigma` gives each
+/// point's standard deviation (weights `1 / sigma`); with
+/// `absolute_sigma` the covariance takes them as exact, otherwise it is
+/// scaled by the residual variance (as SciPy's `curve_fit`). `bounds`
+/// box the parameters (trust-region reflective), `opts.loss` makes the
+/// fit robust.
+///
+/// ```nabi
+/// use optimize::Dual;
+/// use core::array::Vector;
+///
+/// // NIST StRD Misra1a, certified b1 = 238.94212918, b2 = 5.5015643181e-4.
+/// let x: Vector<f64> = [77.6, 114.9, 141.1, 190.8, 239.9, 289.0, 332.8, 378.4, 434.8, 477.3, 536.8, 593.1, 689.1, 760.0];
+/// let y: Vector<f64> = [10.07, 14.73, 17.94, 23.93, 29.61, 35.18, 40.02, 44.82, 50.76, 55.05, 61.01, 66.40, 75.47, 81.78];
+/// let model = |x: f64, b: Vector<Dual>| -> Dual { b[0] * (1.0 - (b[1] * -x).exp()) };
+/// let fit = try optimize::curve_fit(model, x, y, [500.0, 1e-4]);
+/// assert((fit.params[0] / 238.94212918 - 1.0).abs() < 1e-8);
+/// assert((fit.stderr[0] / 2.7070075241 - 1.0).abs() < 1e-6);
+/// ```
+pub fn curve_fit<M: Model>(f: M, xdata: Vector<f64>, ydata: Vector<f64>, p0: Vector<f64>, sigma: Vector<f64>? = none, absolute_sigma: bool = false, bounds: Bounds? = none, opts: LsqOptions = LsqOptions {}) throws (OptimizeError) -> Fit {
+    let m = xdata.len();
+    let n = p0.len();
+    if ydata.len() != m { throw shape(f"xdata has {m} points, ydata {ydata.len()}"); }
+    if m == 0 { throw shape("no data points"); }
+    try finite(xdata, "xdata");
+    try finite(ydata, "ydata");
+    let w: Vector<f64> = Array::full([m], 1.0);
+    match sigma {
+        none => {}
+        s: Vector<f64> => {
+            if s.len() != m { throw shape(f"sigma has {s.len()} elements, the data {m}"); }
+            for i in 0..m {
+                if !(s[i] > 0.0) || !s[i].is_finite() { throw OptimizeError::BadOption { what: f"sigma[{i}] = {s[i]}; every sigma must be positive and finite" }; }
+                w[i] = 1.0 / s[i];
+            }
+        }
+    }
+    let res = f.residuals(xdata, ydata, w);
+    let ls = try least_squares(res, p0, bounds: bounds, method: none, opts: opts);
+    let j = ls.jac;
+    let rss = 2.0 * ls.cost;
+    let cov: Matrix<f64> = Array::full([n, n], f64::INFINITY);
+    let ok = m > n || absolute_sigma;
+    let sv = try? linalg::svd(j);
+    match sv {
+        none => {}
+        s: linalg::Svd<f64> => {
+            let sing = s.s();
+            let vt = s.vt();
+            let k = sing.len();
+            let cut = if k > 0 { EPS * (m.max(n) as f64) * sing[0] } else { 0.0 };
+            let c: Matrix<f64> = Array::zeros([n, n]);
+            for a in 0..n {
+                for bb in 0..n {
+                    let t = 0.0;
+                    for q in 0..k {
+                        if sing[q] > cut { t += vt[q, a] * vt[q, bb] / (sing[q] * sing[q]); }
+                    }
+                    c[a, bb] = t;
+                }
+            }
+            if ok {
+                let scale = if absolute_sigma { 1.0 } else { rss / ((m - n) as f64) };
+                cov = c .* scale;
+            }
+        }
+    }
+    let se: Vector<f64> = Array::zeros([n]);
+    for i in 0..n { se[i] = cov[i, i].max(0.0).sqrt(); }
+    let r: Vector<f64> = Array::zeros([m]);
+    for i in 0..m { r[i] = -ls.fun[i] / w[i]; }
+    Fit { params: ls.x, cov, stderr: se, residuals: r, rss, dof: if m > n { m - n } else { 0 }, solver: ls }
+}

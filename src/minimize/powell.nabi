@@ -1,0 +1,105 @@
+// Powell's conjugate direction method (Powell 1964, with his test for
+// when to replace a direction): line minimizations by Brent's method
+// along a set of directions that turn conjugate on a quadratic.
+// No derivatives; usually far fewer evaluations than Nelder-Mead.
+
+use pkg::IntoObjective;
+use pkg::error::OptimizeError;
+use pkg::minimize::{done, report, start};
+use pkg::objective::Eval;
+use pkg::result::{Minimum, Options, Status};
+use pkg::scalar::min::bracket;
+use core::array::{Array, Vector};
+use linalg::AsVector;
+
+/// Minimizes along `d` from `x`: Brent on f(x + t d) after bracketing
+/// from t = 0, 1. Returns the new point, its value and the step `t d`.
+fn along(ref ev: Eval, x: Vector<f64>, fx: f64, d: Vector<f64>, tol: f64) -> (Vector<f64>, f64, Vector<f64>) {
+    let o = ev.o;
+    let counter = [0];
+    let phi = |t: f64| -> f64 {
+        counter[0] += 1;
+        (o.f)(x .+ t .* d)
+    };
+    let found = try? bracket(phi, 0.0, 1.0, 100.0, 200);
+    let r: pkg::scalar::min::ScalarMin? = match found {
+        none => none,
+        b: pkg::scalar::min::Bracket => try? pkg::scalar::min::brent(phi, b, tol),
+    };
+    ev.nfev += counter[0];
+    match r {
+        none => (x, fx, d .* 0.0),
+        m: pkg::scalar::min::ScalarMin => {
+            if m.fun < fx { (x .+ m.x .* d, m.fun, m.x .* d) } else { (x, fx, d .* 0.0) }
+        }
+    }
+}
+
+/// Powell's method: `n` line minimizations per iteration along a
+/// direction set, replacing the direction of largest decrease by the
+/// overall step when that helps (it keeps the set from collapsing).
+/// Stops when an iteration lowers `f` by less than `ftol (|f| + |f_old|)
+/// / 2`.
+///
+/// ```nabi
+/// let m = try optimize::powell(optimize::problems::powell_singular::<f64>, [3.0, -1.0, 0.0, 1.0]);
+/// assert(m.success() && m.fun < 1e-12);
+/// ```
+pub fn powell<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    let (ev, x, fval, _) = try start(f.into_objective(), x0, false);
+    let n = x.len();
+    let dirs: List<Vector<f64>> = [];
+    for i in 0..n {
+        let e: Vector<f64> = Array::zeros([n]);
+        e[i] = 1.0;
+        dirs.push(e);
+    }
+    let iters = opts.iters(n, 1000);
+    let ltol = opts.xtol.sqrt().max(1e-10);
+    let k = 0;
+    let status = Status::MaxIterations;
+    while k < iters {
+        // Powell's names: f1 at the start p0 of the sweep, f2 at its end pn,
+        // f3 at the extrapolated point 2 pn - p0; delta the largest single
+        // decrease, along dirs[big].
+        let p0 = x.copy();
+        let f1 = fval;
+        let big = 0;
+        let delta = 0.0;
+        for i in 0..n {
+            let before = fval;
+            let (xn, fn_, _) = along(ref ev, x, fval, dirs[i], ltol);
+            x = xn;
+            fval = fn_;
+            if before - fval > delta {
+                delta = before - fval;
+                big = i;
+            }
+        }
+        k += 1;
+        if !fval.is_finite() { status = Status::NotFinite; break; }
+        if report(opts, k, x, fval, Vector::<f64>::from(List::new())) { status = Status::Stopped; break; }
+        if 2.0 * (f1 - fval) <= opts.ftol * (f1.abs() + fval.abs()) + 1e-20 { status = Status::Converged; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+        let f2 = fval;
+        let dir = x .- p0;
+        let f3 = ev.f(x .+ dir);
+        // Keep the set unless f3 < f1 and (f1 - 2 f2 + f3) (f1 - f2 -
+        // delta)^2 < delta (f1 - f3)^2 / 2; else search along the sweep's
+        // net step and let it replace dirs[big].
+        let keep = f3 >= f1 || (f1 - 2.0 * f2 + f3) * (f1 - f2 - delta) * (f1 - f2 - delta) >= 0.5 * delta * (f1 - f3) * (f1 - f3);
+        if !keep {
+            let (xn, fn_, step) = along(ref ev, x, fval, dir, ltol);
+            x = xn;
+            fval = fn_;
+            let moved = false;
+            for v in step { if v != 0.0 { moved = true; } }
+            if moved {
+                dirs[big] = dirs[n - 1];
+                dirs[n - 1] = step;
+            }
+        }
+    }
+    done(ev, x, fval, Vector::<f64>::from(List::new()), status, k, "Powell")
+}

@@ -1,0 +1,34 @@
+// Tests: standard problems with known minima (More, Garbow and
+// Hillstrom), NIST StRD nonlinear regression against certified values,
+// small LPs and QPs with known optima, constraint satisfaction,
+// derivative checks, scalar roots and minima, edge cases and the
+// operators.
+
+pub mod mgh;
+
+mod bounded;
+mod constrained;
+mod derivative;
+mod edge;
+mod global;
+mod linear;
+mod lsq;
+#[cfg(feature = "ops")]
+mod ops;
+mod scalar;
+mod system;
+mod unconstrained;
+
+pub fn expect(ok: bool, what: str) {
+    if !ok { panic(f"check failed: {what}"); }
+}
+
+/// `|a - b| <= tol`.
+pub fn close(a: f64, b: f64, tol: f64, what: str) {
+    if !((a - b).abs() <= tol) { panic(f"check failed: {what}: {a} vs {b} (tol {tol})"); }
+}
+
+/// `|a / b - 1| <= tol`.
+pub fn rel(a: f64, b: f64, tol: f64, what: str) {
+    if !((a / b - 1.0).abs() <= tol) { panic(f"check failed: {what}: {a} vs {b} (rel tol {tol})"); }
+}

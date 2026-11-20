@@ -1,0 +1,51 @@
+//! Notation for optimization (feature `ops`, on by default):
+//!
+//!   2.0ε        the dual number 0 + 2ε: `x + 1.0ε` seeds a derivative
+//!   c ⩽ b       the constraint c(x) <= b (level of `<=`)
+//!   c ⩾ b       the constraint c(x) >= b
+//!   c ≐ b       the constraint c(x) = b (level of `==`)
+//!   ∇(f)        the gradient of f as a function (autodiff's `∇`)
+//!   ∂(f)        the derivative of f as a function (autodiff's `∂`)
+//!
+//! `≤`, `≥` and `≡` cannot be used: the lexer reads them as the fixed
+//! `<=`, `>=` and `==`. `ε`, `∂` and `∇` are autodiff's, re-exported, so
+//! importing this module with interpolate's `ops` brings one of each.
+//! The dual-number arithmetic (`+ - * / **`, prefix `√`) and
+//! `x ∈ bounds` need no feature.
+
+pub use autodiff::ops::{Derive, Gradient, dual_literal, ∂, ∇};
+
+use pkg::{Constraint, IntoObjective};
+
+/// `c ⩽ b`, `c ⩾ b`, `c ≐ b`: a `Constraint` from a function (any
+/// `IntoObjective`) and a bound. `⩽` and `⩾` bind like `<=`, `≐` like
+/// `==`, so `c ⩽ 2.0 * k` needs no parentheses.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let budget = |x: Vector<f64>| -> f64 { x[0] + x[1] };
+/// let c = budget ⩽ 1.0;
+/// assert(c.violation([1.0, 1.0]) == 1.0);
+/// let m = try optimize::minimize(|x: Vector<f64>| -> f64 { -(x[0] * x[1]) }, [0.1, 0.2], constraints: [budget ⩽ 1.0]);
+/// assert((m.x[0] - 0.5).abs() < 1e-6);
+/// let on = budget ≐ 2.0;
+/// assert(on.violation([1.0, 0.5]) == 0.5);
+/// ```
+pub trait Relation {
+    /// `self(x) <= b`.
+    #[infix("⩽", like = "<=")]
+    fn at_most(self, b: f64) -> Constraint;
+    /// `self(x) >= b`.
+    #[infix("⩾", like = ">=")]
+    fn at_least(self, b: f64) -> Constraint;
+    /// `self(x) = b`.
+    #[infix("≐", like = "==")]
+    fn equals(self, b: f64) -> Constraint;
+}
+
+impl<F: IntoObjective> Relation for F {
+    fn at_most(self, b: f64) -> Constraint { Constraint::le(self, b) }
+    fn at_least(self, b: f64) -> Constraint { Constraint::ge(self, b) }
+    fn equals(self, b: f64) -> Constraint { Constraint::eq(self, b) }
+}

@@ -1,0 +1,69 @@
+// Bad input: each error says what went wrong and what to do; empty and
+// non-finite starts, NaN objectives, 1-D problems, huge and tiny scales.
+
+use pkg::tests::suite::{close, expect};
+use pkg::{Bounds, Dual, Objective, OptimizeError, Options, Status};
+use core::array::{Array, Vector};
+
+fn message(f: fn() throws (OptimizeError)) -> str { try { f(); "" } catch e: OptimizeError { f"{e}" } }
+
+#[test]
+fn bad_starts() {
+    let f = pkg::problems::rosenbrock();
+    let e1 = message(|| { _ = try pkg::bfgs(f, List::<f64>::new()); });
+    expect(e1.contains("no variables"), e1);
+    let e2 = message(|| { _ = try pkg::lbfgs(f, [f64::NAN, 1.0]); });
+    expect(e2.contains("x0") && e2.contains("NaN"), e2);
+    let e3 = message(|| { _ = try pkg::nelder_mead(|x: Vector<f64>| -> f64 { x[0].ln() }, [-1.0]); });
+    expect(e3.contains("f(x0)"), e3);
+    let e4 = message(|| { _ = try pkg::lbfgs(f, [1.0, 1.0], Options { memory: 0 }); });
+    expect(e4.contains("memory"), e4);
+    let e5 = message(|| { _ = try pkg::trust_ncg(f, [1.0, 1.0], radius: -1.0); });
+    expect(e5.contains("radius"), e5);
+    let e6 = message(|| { _ = try pkg::line_search(f, [0.0, 0.0], [-1.0, 0.0]); });
+    expect(e6.contains("descent"), e6);
+    let e7 = message(|| { _ = try pkg::minimize(f, [0.0, 0.0], method: pkg::Method::Bfgs, bounds: try Bounds::uniform(2, 0.0, 1.0)); });
+    expect(e7.contains("LbfgsB"), e7);
+}
+
+#[test]
+fn nan_regions_are_avoided() {
+    // ln is undefined left of 0: the line search must back off.
+    let f = |x: Vector<Dual>| -> Dual { x[0] - x[0].ln() * 2.0 };
+    let m = try! pkg::bfgs(f, [10.0]);
+    expect(m.success(), f"{m}");
+    close(m.x[0], 2.0, 1e-6, "minimum of x - 2 ln x");
+}
+
+#[test]
+fn one_dimension_and_already_optimal() {
+    let m = try! pkg::bfgs(pkg::problems::sphere::<Dual>, [0.0]);
+    expect(m.success() && m.iterations == 0, "start at the minimum");
+    let n = try! pkg::nelder_mead(pkg::problems::sphere::<f64>, [3.0]);
+    close(n.x[0], 0.0, 1e-5, "1-D simplex");
+    let p = try! pkg::powell(pkg::problems::sphere::<f64>, [3.0]);
+    close(p.x[0], 0.0, 1e-8, "1-D Powell");
+}
+
+#[test]
+fn scales() {
+    // Minimum at 1e6 and at 1e-6: relative tolerances must hold.
+    let big = |x: Vector<Dual>| -> Dual { ((x[0] - 1e6) / 1e6) ** 2 };
+    let m = try! pkg::bfgs(big, [0.0]);
+    close(m.x[0] / 1e6, 1.0, 1e-6, "large scale");
+    let small = |x: Vector<Dual>| -> Dual { ((x[0] - 1e-6) * 1e6) ** 2 };
+    let s = try! pkg::bfgs(small, [0.0]);
+    close(s.x[0] * 1e6, 1.0, 1e-6, "small scale");
+}
+
+#[test]
+fn status_messages() {
+    for st in [Status::Converged, Status::MaxIterations, Status::MaxEvaluations, Status::LineSearchFailed, Status::Stopped, Status::NotFinite, Status::Infeasible, Status::Unbounded, Status::Stalled] {
+        expect(f"{st}".len() > 8, f"{st:?} has a message");
+    }
+    let o = Objective::new(pkg::problems::rosen::<f64>);
+    let m = try! pkg::bfgs(o, [-1.2, 1.0]);
+    expect(f"{m}".contains("BFGS: converged"), f"{m}");
+    let x: Vector<f64> = Array::zeros([2]);
+    expect(o.value(x) == 1.0, "f(0) = 1");
+}

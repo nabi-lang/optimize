@@ -1,0 +1,362 @@
+// Line searches along a descent direction p from x: find a step a with
+// phi(a) = f(x + a p) decreasing enough (Armijo, c1) and, for the Wolfe
+// searches, |phi'(a)| <= c2 |phi'(0)| (strong curvature).
+//
+// MoreThuente: More and Thuente (1994), the MINPACK-2 dcsrch/dcstep
+// safeguarded cubic/quadratic steps. StrongWolfe: Nocedal and Wright
+// (2006), Algorithms 3.5 and 3.6 with cubic interpolation in the zoom.
+// Backtracking: Armijo with safeguarded quadratic interpolation.
+
+use pkg::IntoObjective;
+use pkg::error::{OptimizeError, finite, shape};
+use pkg::objective::{Eval, dot};
+use core::array::Vector;
+
+/// A line search for the gradient methods (`Options.line_search`).
+///
+/// ```nabi
+/// use optimize::{LineSearch, Options};
+///
+/// let o = Options { line_search: LineSearch::StrongWolfe };
+/// assert((try optimize::bfgs(optimize::problems::rosenbrock(), [-1.2, 1.0], o)).success());
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LineSearch {
+    /// More-Thuente: strong Wolfe conditions by safeguarded cubic steps
+    /// (MINPACK-2), the most robust; the default.
+    MoreThuente,
+    /// Strong Wolfe conditions by bracketing and cubic zoom (Nocedal
+    /// and Wright, Algorithms 3.5 and 3.6).
+    StrongWolfe,
+    /// Armijo backtracking with quadratic interpolation: sufficient
+    /// decrease only, the cheapest; fine for Newton-type steps.
+    Backtracking,
+}
+
+/// A step found by a line search.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let p: Vector<f64> = [1.0, 1.0];
+/// let s = try optimize::line_search(optimize::problems::rosenbrock(), [-1.2, 1.0], p);
+/// assert(s.success && s.fun < 24.2);
+/// ```
+#[derive(Clone, Debug)]
+pub struct LineStep {
+    /// The step length `a`.
+    pub alpha: f64;
+    /// `x + a p`.
+    pub x: Vector<f64>;
+    /// `f(x + a p)`.
+    pub fun: f64;
+    /// The gradient at `x + a p` (empty after `Backtracking`).
+    pub grad: Vector<f64>;
+    /// Function evaluations used.
+    pub nfev: usize;
+    /// Whether the conditions were met.
+    pub success: bool;
+}
+
+/// Searches along `p` from `x` for a step meeting the Armijo (`c1`)
+/// and strong curvature (`c2`) conditions, starting from `alpha = 1`.
+/// Throws when `p` is not a descent direction or the shapes differ.
+///
+/// ```nabi
+/// use core::array::Vector;
+/// use optimize::LineSearch;
+///
+/// let f = optimize::problems::rosenbrock();
+/// let x: Vector<f64> = [0.0, 0.0];
+/// let p = f.gradient(x) .* -1.0;
+/// let s = try optimize::line_search(f, x, p, method: LineSearch::StrongWolfe);
+/// assert(s.success && s.fun < 1.0);
+/// ```
+pub fn line_search<F: IntoObjective>(f: F, x: Vector<f64>, p: Vector<f64>, method: LineSearch = LineSearch::MoreThuente, c1: f64 = 1e-4, c2: f64 = 0.9) throws (OptimizeError) -> LineStep {
+    if x.len() != p.len() { throw shape(f"x has {x.len()} elements, p {p.len()}"); }
+    try finite(x, "x");
+    try finite(p, "p");
+    let ev = Eval::of(f.into_objective());
+    let (f0, g0) = ev.fg(x);
+    if !f0.is_finite() { throw OptimizeError::NotFinite { what: "f(x)" }; }
+    let d0 = dot(g0, p);
+    if !(d0 < 0.0) { throw OptimizeError::BadOption { what: f"p is not a descent direction (grad . p = {d0} >= 0); pass -grad or another direction with grad . p < 0" }; }
+    let r = search(method, ref ev, x, f0, g0, p, 1.0, 1e10, c1, c2);
+    LineStep { alpha: r.alpha, x: r.x, fun: r.f, grad: r.g, nfev: ev.nfev, success: r.ok }
+}
+
+/// A line-search outcome inside the solvers.
+pub(pkg) struct Ls {
+    pub(pkg) alpha: f64;
+    pub(pkg) x: Vector<f64>;
+    pub(pkg) f: f64;
+    pub(pkg) g: Vector<f64>;
+    pub(pkg) ok: bool;
+}
+
+/// Runs `kind` from `alpha0` (at most `amax`). On failure the result
+/// is the best point seen (possibly `x` itself with `alpha = 0`).
+pub(pkg) fn search(kind: LineSearch, ref ev: Eval, x: Vector<f64>, f0: f64, g0: Vector<f64>, p: Vector<f64>, alpha0: f64, amax: f64, c1: f64, c2: f64) -> Ls {
+    match kind {
+        LineSearch::MoreThuente => more_thuente(ref ev, x, f0, g0, p, alpha0.min(amax), amax, c1, c2),
+        LineSearch::StrongWolfe => wolfe(ref ev, x, f0, g0, p, alpha0.min(amax), amax, c1, c2),
+        LineSearch::Backtracking => {
+            let r = backtrack(ref ev, x, f0, dot(g0, p), p, alpha0.min(amax), c1);
+            if r.ok { r.g = ev.g(r.x); }
+            r
+        }
+    }
+}
+
+fn at(x: Vector<f64>, a: f64, p: Vector<f64>) -> Vector<f64> { x .+ a .* p }
+
+/// Armijo backtracking: `f(x + a p) <= f0 + c1 a d0`. Leaves `g`
+/// empty.
+pub(pkg) fn backtrack(ref ev: Eval, x: Vector<f64>, f0: f64, d0: f64, p: Vector<f64>, alpha0: f64, c1: f64) -> Ls {
+    let a = alpha0;
+    for _ in 0..60 {
+        let xa = at(x, a, p);
+        let fa = ev.f(xa);
+        if fa.is_finite() && fa <= f0 + c1 * a * d0 {
+            return Ls { alpha: a, x: xa, f: fa, g: Vector::<f64>::from(List::new()), ok: true };
+        }
+        // Minimizer of the quadratic through f0, d0 and fa, kept in
+        // [0.1 a, 0.5 a].
+        let next = if fa.is_finite() { -d0 * a * a / (2.0 * (fa - f0 - d0 * a)) } else { 0.1 * a };
+        a = next.max(0.1 * a).min(0.5 * a);
+        if a < 1e-20 { break; }
+    }
+    Ls { alpha: 0.0, x, f: f0, g: Vector::<f64>::from(List::new()), ok: false }
+}
+
+/// The minimizer of the cubic through (a, fa, da) and (b, fb, db), or
+/// NaN when it does not exist.
+fn cubicmin(a: f64, fa: f64, da: f64, b: f64, fb: f64, db: f64) -> f64 {
+    let d1 = da + db - 3.0 * (fa - fb) / (a - b);
+    let s = d1 * d1 - da * db;
+    if !(s >= 0.0) { return f64::NAN; }
+    let d2 = (if b > a { 1.0 } else { -1.0 }) * s.sqrt();
+    b - (b - a) * (db + d2 - d1) / (db - da + 2.0 * d2)
+}
+
+fn wolfe(ref ev: Eval, x: Vector<f64>, f0: f64, g0: Vector<f64>, p: Vector<f64>, alpha0: f64, amax: f64, c1: f64, c2: f64) -> Ls {
+    let d0 = dot(g0, p);
+    let a_prev = 0.0;
+    let f_prev = f0;
+    let d_prev = d0;
+    let a = alpha0;
+    let best = Ls { alpha: 0.0, x, f: f0, g: g0, ok: false };
+    for i in 0..30 {
+        let xa = at(x, a, p);
+        let (fa, ga) = ev.fg(xa);
+        if !fa.is_finite() {
+            // Step into a region where f is not defined: shrink.
+            a = 0.5 * (a_prev + a);
+            continue;
+        }
+        let da = dot(ga, p);
+        if fa < best.f { best = Ls { alpha: a, x: xa, f: fa, g: ga, ok: false }; }
+        if fa > f0 + c1 * a * d0 || (i > 0 && fa >= f_prev) {
+            return zoom(ref ev, x, f0, d0, p, a_prev, f_prev, d_prev, a, fa, da, c1, c2, best);
+        }
+        if da.abs() <= -c2 * d0 { return Ls { alpha: a, x: xa, f: fa, g: ga, ok: true }; }
+        if da >= 0.0 {
+            return zoom(ref ev, x, f0, d0, p, a, fa, da, a_prev, f_prev, d_prev, c1, c2, best);
+        }
+        if a >= amax { return best; }
+        a_prev = a;
+        f_prev = fa;
+        d_prev = da;
+        a = (2.0 * a).min(amax);
+    }
+    best
+}
+
+fn zoom(ref ev: Eval, x: Vector<f64>, f0: f64, d0: f64, p: Vector<f64>, lo0: f64, flo0: f64, dlo0: f64, hi0: f64, fhi0: f64, dhi0: f64, c1: f64, c2: f64, best0: Ls) -> Ls {
+    let (lo, flo, dlo, hi, fhi, dhi) = (lo0, flo0, dlo0, hi0, fhi0, dhi0);
+    let best = best0;
+    for _ in 0..40 {
+        let w = hi - lo;
+        let a = cubicmin(lo, flo, dlo, hi, fhi, dhi);
+        let (l, h) = if lo < hi { (lo, hi) } else { (hi, lo) };
+        // Keep the trial away from the ends of the interval.
+        if !(a > l + 0.1 * (h - l) && a < h - 0.1 * (h - l)) { a = lo + 0.5 * w; }
+        let xa = at(x, a, p);
+        let (fa, ga) = ev.fg(xa);
+        let da = dot(ga, p);
+        if fa.is_finite() && fa < best.f { best = Ls { alpha: a, x: xa, f: fa, g: ga, ok: false }; }
+        if !fa.is_finite() || fa > f0 + c1 * a * d0 || fa >= flo {
+            hi = a;
+            fhi = fa;
+            dhi = da;
+        } else {
+            if da.abs() <= -c2 * d0 { return Ls { alpha: a, x: xa, f: fa, g: ga, ok: true }; }
+            if da * (hi - lo) >= 0.0 {
+                hi = lo;
+                fhi = flo;
+                dhi = dlo;
+            }
+            lo = a;
+            flo = fa;
+            dlo = da;
+        }
+        if (hi - lo).abs() <= 1e-16 * lo.abs().max(1.0) { break; }
+    }
+    // Accept a point with sufficient decrease even if the curvature
+    // test failed: the solvers can still use it.
+    if best.alpha > 0.0 && best.f <= f0 + c1 * best.alpha * d0 { best.ok = true; }
+    best
+}
+
+/// The interval state of dcsrch.
+struct Mt {
+    stx: f64; fx: f64; dx: f64;
+    sty: f64; fy: f64; dy: f64;
+    brackt: bool;
+}
+
+/// dcstep: the safeguarded next step; updates the interval of
+/// uncertainty in `s` and returns the new trial step.
+fn dcstep(ref s: Mt, stp: f64, fp: f64, dp: f64, stpmin: f64, stpmax: f64) -> f64 {
+    let (stx, fx, dx, sty, fy, dy) = (s.stx, s.fx, s.dx, s.sty, s.fy, s.dy);
+    let sgnd = dp * (dx / dx.abs());
+    let stpf = 0.0;
+    if fp > fx {
+        // Higher value: the minimum is bracketed; the cubic step, or
+        // halfway to the quadratic one.
+        let theta = 3.0 * (fx - fp) / (stp - stx) + dx + dp;
+        let m = theta.abs().max(dx.abs()).max(dp.abs());
+        let gamma = m * ((theta / m) * (theta / m) - (dx / m) * (dp / m)).sqrt();
+        if stp < stx { gamma = -gamma; }
+        let pp = (gamma - dx) + theta;
+        let q = ((gamma - dx) + gamma) + dp;
+        let stpc = stx + (pp / q) * (stp - stx);
+        let stpq = stx + ((dx / ((fx - fp) / (stp - stx) + dx)) / 2.0) * (stp - stx);
+        stpf = if (stpc - stx).abs() < (stpq - stx).abs() { stpc } else { stpc + (stpq - stpc) / 2.0 };
+        s.brackt = true;
+    } else if sgnd < 0.0 {
+        // Derivatives of opposite sign: bracketed; the step farther from
+        // stp of the cubic and the secant.
+        let theta = 3.0 * (fx - fp) / (stp - stx) + dx + dp;
+        let m = theta.abs().max(dx.abs()).max(dp.abs());
+        let gamma = m * ((theta / m) * (theta / m) - (dx / m) * (dp / m)).sqrt();
+        if stp > stx { gamma = -gamma; }
+        let pp = (gamma - dp) + theta;
+        let q = ((gamma - dp) + gamma) + dx;
+        let stpc = stp + (pp / q) * (stx - stp);
+        let stpq = stp + (dp / (dp - dx)) * (stx - stp);
+        stpf = if (stpc - stp).abs() > (stpq - stp).abs() { stpc } else { stpq };
+        s.brackt = true;
+    } else if dp.abs() < dx.abs() {
+        // Same sign, the derivative falls in magnitude.
+        let theta = 3.0 * (fx - fp) / (stp - stx) + dx + dp;
+        let m = theta.abs().max(dx.abs()).max(dp.abs());
+        let gamma = m * (0.0f64.max((theta / m) * (theta / m) - (dx / m) * (dp / m))).sqrt();
+        if stp > stx { gamma = -gamma; }
+        let pp = (gamma - dp) + theta;
+        let q = (gamma + (dx - dp)) + gamma;
+        let r = pp / q;
+        let stpc = if r < 0.0 && gamma != 0.0 { stp + r * (stx - stp) } else if stp > stx { stpmax } else { stpmin };
+        let stpq = stp + (dp / (dp - dx)) * (stx - stp);
+        if s.brackt {
+            stpf = if (stpc - stp).abs() < (stpq - stp).abs() { stpc } else { stpq };
+            stpf = if stp > stx { (stp + 0.66 * (sty - stp)).min(stpf) } else { (stp + 0.66 * (sty - stp)).max(stpf) };
+        } else {
+            stpf = if (stpc - stp).abs() > (stpq - stp).abs() { stpc } else { stpq };
+            stpf = stpmax.min(stpf).max(stpmin);
+        }
+    } else {
+        // Same sign, the derivative does not fall: step to the far end
+        // or by the cubic through stp and sty.
+        if s.brackt {
+            let theta = 3.0 * (fp - fy) / (sty - stp) + dy + dp;
+            let m = theta.abs().max(dy.abs()).max(dp.abs());
+            let gamma = m * ((theta / m) * (theta / m) - (dy / m) * (dp / m)).sqrt();
+            if stp > sty { gamma = -gamma; }
+            let pp = (gamma - dp) + theta;
+            let q = ((gamma - dp) + gamma) + dy;
+            stpf = stp + (pp / q) * (sty - stp);
+        } else {
+            stpf = if stp > stx { stpmax } else { stpmin };
+        }
+    }
+    if fp > fx {
+        s.sty = stp;
+        s.fy = fp;
+        s.dy = dp;
+    } else {
+        if sgnd < 0.0 {
+            s.sty = stx;
+            s.fy = fx;
+            s.dy = dx;
+        }
+        s.stx = stp;
+        s.fx = fp;
+        s.dx = dp;
+    }
+    stpf
+}
+
+fn more_thuente(ref ev: Eval, x: Vector<f64>, f0: f64, g0: Vector<f64>, p: Vector<f64>, alpha0: f64, amax: f64, ftol: f64, gtol: f64) -> Ls {
+    let xtol = 1e-14;
+    let stpmin = 0.0;
+    let stpmax = amax;
+    let ginit = dot(g0, p);
+    let gtest = ftol * ginit;
+    let width = stpmax - stpmin;
+    let width1 = 2.0 * width;
+    let s = Mt { stx: 0.0, fx: f0, dx: ginit, sty: 0.0, fy: f0, dy: ginit, brackt: false };
+    let stage = 1;
+    let stmin = 0.0;
+    let stmax = alpha0 + 4.0 * alpha0;
+    let stp = alpha0;
+    // The point at stx, the best one with sufficient decrease so far.
+    let best = Ls { alpha: 0.0, x, f: f0, g: g0, ok: false };
+    for _ in 0..40 {
+        let xa = at(x, stp, p);
+        let (f, ga) = ev.fg(xa);
+        if !f.is_finite() {
+            // Outside the domain of f: back off towards stx.
+            stp = s.stx + 0.25 * (stp - s.stx);
+            if (stp - s.stx).abs() <= 1e-16 * stp.abs().max(1.0) { break; }
+            s.brackt = true;
+            s.sty = stp * 4.0;
+            continue;
+        }
+        let g = dot(ga, p);
+        let ftest = f0 + stp * gtest;
+        if stage == 1 && f <= ftest && g >= 0.0 { stage = 2; }
+        if f <= ftest && g.abs() <= gtol * (-ginit) { return Ls { alpha: stp, x: xa, f, g: ga, ok: true }; }
+        if f <= ftest && f < best.f { best = Ls { alpha: stp, x: xa, f, g: ga, ok: false }; }
+        if s.brackt && (stp <= stmin || stp >= stmax) { break; }
+        if s.brackt && stmax - stmin <= xtol * stmax { break; }
+        if stp == stpmax && f <= ftest && g <= gtest { return Ls { alpha: stp, x: xa, f, g: ga, ok: true }; }
+        if stp == stpmin && (f > ftest || g >= gtest) { break; }
+        let stx_was = s.stx;
+        if stage == 1 && f <= s.fx && f > ftest {
+            // The modified function psi(a) = phi(a) - phi(0) - gtest a
+            // until a step with phi' >= 0 is found.
+            let m = Mt { stx: s.stx, fx: s.fx - s.stx * gtest, dx: s.dx - gtest, sty: s.sty, fy: s.fy - s.sty * gtest, dy: s.dy - gtest, brackt: s.brackt };
+            stp = dcstep(ref m, stp, f - stp * gtest, g - gtest, stmin, stmax);
+            s = Mt { stx: m.stx, fx: m.fx + m.stx * gtest, dx: m.dx + gtest, sty: m.sty, fy: m.fy + m.sty * gtest, dy: m.dy + gtest, brackt: m.brackt };
+        } else {
+            stp = dcstep(ref s, stp, f, g, stmin, stmax);
+        }
+        _ = stx_was;
+        if s.brackt {
+            if (s.sty - s.stx).abs() >= 0.66 * width1 { stp = s.stx + 0.5 * (s.sty - s.stx); }
+            width1 = width;
+            width = (s.sty - s.stx).abs();
+            stmin = s.stx.min(s.sty);
+            stmax = s.stx.max(s.sty);
+        } else {
+            stmin = stp + 1.1 * (stp - s.stx);
+            stmax = stp + 4.0 * (stp - s.stx);
+        }
+        stp = stp.max(stpmin).min(stpmax);
+        if (s.brackt && (stp <= stmin || stp >= stmax)) || (s.brackt && stmax - stmin <= xtol * stmax) { stp = s.stx; }
+        if !(stp > 0.0) { break; }
+    }
+    if best.alpha > 0.0 { best.ok = true; }
+    best
+}

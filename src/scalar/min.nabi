@@ -1,0 +1,314 @@
+// Minima of f: R -> R. A bracket (a, b, c) with f(b) below f(a) and
+// f(c) holds a local minimum; `bracket` finds one walking downhill with
+// growing steps, by the golden ratio or to the vertex of the parabola
+// through the last three points when that lies further ahead; a vertex
+// between the last two points is tried as the middle of a bracket.
+// Golden section (Kiefer 1953) shrinks a bracket by 0.618 per
+// evaluation; Brent's localmin (Brent 1973) mixes parabolic
+// interpolation in; `bounded` is localmin on a fixed interval.
+
+use pkg::error::{OptimizeError, option};
+use pkg::result::Status;
+
+// The golden ratio, and (3 - sqrt 5) / 2 = 2 - PHI, Brent's c.
+const PHI: f64 = 1.618033988749895;
+const GOLDEN: f64 = 0.3819660112501051;
+const SQRT_EPS: f64 = 1.4901161193847656e-8;
+
+/// Three points `a < b < c` (or `a > b > c`) with `f(b) < f(a)` and
+/// `f(b) < f(c)`: a local minimum lies between `a` and `c`.
+///
+/// ```nabi
+/// use optimize::Bracket;
+///
+/// let f = |x: f64| -> f64 { (x - 2.0) ** 2 };
+/// let br = try Bracket::new(f, 0.0, 1.0, 5.0);
+/// assert(br.fb == 1.0);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Bracket {
+    /// One end.
+    pub a: f64;
+    /// The inner point.
+    pub b: f64;
+    /// The other end.
+    pub c: f64;
+    /// `f(a)`.
+    pub fa: f64;
+    /// `f(b)`.
+    pub fb: f64;
+    /// `f(c)`.
+    pub fc: f64;
+    /// Evaluations spent finding it.
+    pub nfev: usize;
+}
+
+impl Bracket {
+    /// Checks that `(a, b, c)` brackets a minimum of `f`; throws
+    /// `BadBracket` naming what fails.
+    ///
+    /// ```nabi
+    /// use optimize::Bracket;
+    ///
+    /// let f = |x: f64| -> f64 { x * x };
+    /// assert((try? Bracket::new(f, 1.0, 2.0, 3.0)) == none);
+    /// ```
+    pub fn new(f: fn(f64) -> f64, a: f64, b: f64, c: f64) throws (OptimizeError) -> Bracket {
+        if !((a < b && b < c) || (a > b && b > c)) { throw OptimizeError::BadBracket { what: f"b = {b} is not between a = {a} and c = {c}" }; }
+        let (fa, fb, fc) = (f(a), f(b), f(c));
+        if !(fb < fa && fb < fc) { throw OptimizeError::BadBracket { what: f"f(b) = {fb} is not below f(a) = {fa} and f(c) = {fc}" }; }
+        Bracket { a, b, c, fa, fb, fc, nfev: 3 }
+    }
+}
+
+/// Searches downhill from `a` and `b` for a bracket of a minimum:
+/// golden-ratio steps with parabolic extrapolation, each step at most
+/// `grow` times the last. Throws `BadBracket` if `f` keeps falling
+/// for `max_iter` steps (no minimum in reach) or turns NaN.
+///
+/// ```nabi
+/// let br = try optimize::bracket(|x: f64| -> f64 { (x - 10.0) ** 2 }, 0.0, 1.0);
+/// assert(br.fb < br.fa && br.fb < br.fc);
+/// ```
+pub fn bracket(f: fn(f64) -> f64, a: f64 = 0.0, b: f64 = 1.0, grow: f64 = 110.0, max_iter: usize = 1000) throws (OptimizeError) -> Bracket {
+    if a == b { throw option("a == b; pass two different start points"); }
+    if !(grow > 1.0) { throw option(f"grow = {grow}; it must be > 1"); }
+    let fa = f(a);
+    let fb = f(b);
+    if !fa.is_finite() || !fb.is_finite() { throw OptimizeError::NotFinite { what: "f at a start point" }; }
+    // Walk from the higher start through the lower one.
+    if fb > fa {
+        let (t, ft) = (a, fa);
+        a = b;
+        fa = fb;
+        b = t;
+        fb = ft;
+    }
+    let c = b + PHI * (b - a);
+    let fc = f(c);
+    let nfev = 3;
+    let k = 0;
+    while !(fc > fb) {
+        k += 1;
+        if k > max_iter || !fc.is_finite() || !c.is_finite() {
+            throw OptimizeError::BadBracket { what: f"f keeps falling (f({c}) = {fc}) after {k} steps; it may be unbounded below, or start nearer the minimum" };
+        }
+        if fc == fb && fb == fa { throw OptimizeError::BadBracket { what: f"f is flat (f = {fb} at {a}, {b} and {c})" }; }
+        // The vertex of the parabola through the three points, from the
+        // divided differences d1 = f[a, b] and d2 = f[a, b, c]: (a + b) / 2
+        // - d1 / (2 d2), a minimum when d2 > 0. Measured past c in units of
+        // the last step, it is t.
+        let step = c - b;
+        let r = PHI;
+        let d1 = (fb - fa) / (b - a);
+        let d2 = ((fc - fb) / step - d1) / (c - a);
+        if d2 > 0.0 {
+            let t = (0.5 * (a + b) - 0.5 * d1 / d2 - c) / step;
+            if t > -1.0 && t < 0.0 {
+                // Between b and c: either side of it may close a bracket.
+                let v = c + t * step;
+                let fv = f(v);
+                nfev += 1;
+                if fv < fc { return Bracket { a: b, b: v, c, fa: fb, fb: fv, fc, nfev }; }
+                if fv > fb { return Bracket { a, b, c: v, fa, fb, fc: fv, nfev }; }
+            } else if t > 0.0 {
+                r = t.min(grow).max(PHI);
+            }
+        }
+        let u = c + r * step;
+        let fu = f(u);
+        nfev += 1;
+        a = b;
+        fa = fb;
+        b = c;
+        fb = fc;
+        c = u;
+        fc = fu;
+    }
+    Bracket { a, b, c, fa, fb, fc, nfev }
+}
+
+/// A minimum of a scalar function.
+///
+/// ```nabi
+/// let m = try optimize::minimize_scalar(|x: f64| -> f64 { (x - 1.5) ** 2 + 2.0 });
+/// assert(m.success() && (m.x - 1.5).abs() < 1e-7 && m.fun == 2.0);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ScalarMin {
+    /// The minimizer.
+    pub x: f64;
+    /// `f(x)`.
+    pub fun: f64;
+    /// Iterations taken.
+    pub iterations: usize;
+    /// Evaluations of `f`, the bracket search's included.
+    pub nfev: usize;
+    /// `Converged`, `MaxIterations` or `NotFinite`.
+    pub status: Status;
+}
+
+impl ScalarMin {
+    /// Whether the tolerance was met.
+    ///
+    /// ```nabi
+    /// assert((try optimize::bounded(|x: f64| -> f64 { x * x }, -1.0, 2.0)).success());
+    /// ```
+    pub fn success(self) -> bool { self.status == Status::Converged }
+}
+
+impl Display for ScalarMin {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        try f.write_str(f"{self.status}: f = {self.fun} at x = {self.x} after {self.iterations} iterations ({self.nfev} evaluations)")
+    }
+}
+
+/// Golden-section search inside a bracket: the interval shrinks by
+/// `0.618` per evaluation until it is below `tol |b|` (`tol` at least
+/// `sqrt(eps)`, since `f` is flat to rounding within that of a
+/// minimum).
+///
+/// ```nabi
+/// let f = |x: f64| -> f64 { (x - 2.0) ** 2 };
+/// let m = try optimize::golden(f, try optimize::bracket(f));
+/// assert((m.x - 2.0).abs() < 1e-7);
+/// ```
+pub fn golden(f: fn(f64) -> f64, br: Bracket, tol: f64 = 1.4901161193847656e-8, max_iter: usize = 5000) throws (OptimizeError) -> ScalarMin {
+    if !(tol > 0.0) { throw option(f"tol = {tol}; it must be > 0"); }
+    // Each probe goes into the larger side of the best point x, at the
+    // golden fraction of it; after the first step x sits at that fraction
+    // of [lo, hi] and every probe is reused.
+    let (lo, hi) = (br.a.min(br.c), br.a.max(br.c));
+    let (x, fx) = (br.b, br.fb);
+    let nfev = br.nfev;
+    let k = 0;
+    while hi - lo > 2.0 * tol * x.abs() && k < max_iter {
+        k += 1;
+        let u = if hi - x > x - lo { x + GOLDEN * (hi - x) } else { x - GOLDEN * (x - lo) };
+        let fu = f(u);
+        nfev += 1;
+        if !fu.is_finite() { return ScalarMin { x: u, fun: fu, iterations: k, nfev, status: Status::NotFinite }; }
+        if fu < fx {
+            if u > x { lo = x; } else { hi = x; }
+            x = u;
+            fx = fu;
+        } else if u > x {
+            hi = u;
+        } else {
+            lo = u;
+        }
+    }
+    let st = if k >= max_iter { Status::MaxIterations } else { Status::Converged };
+    ScalarMin { x, fun: fx, iterations: k, nfev, status: st }
+}
+
+/// Brent's method inside a bracket: parabolic interpolation through
+/// the three best points, golden section when that is not safe.
+/// Superlinear on smooth functions, never worse than golden section by
+/// more than a constant.
+///
+/// ```nabi
+/// let f = |x: f64| -> f64 { x.cos() };
+/// let m = try optimize::brent(f, try optimize::bracket(f, 2.0, 3.0));
+/// assert((m.x - f64::PI).abs() < 1e-7);
+/// ```
+pub fn brent(f: fn(f64) -> f64, br: Bracket, tol: f64 = 1.4901161193847656e-8, max_iter: usize = 500) throws (OptimizeError) -> ScalarMin {
+    if !(tol > 0.0) { throw option(f"tol = {tol}; it must be > 0"); }
+    let r = localmin(f, br.a.min(br.c), br.a.max(br.c), br.b, br.fb, tol, 1e-11, max_iter);
+    ScalarMin { x: r.x, fun: r.fun, iterations: r.iterations, nfev: r.nfev + br.nfev, status: r.status }
+}
+
+/// Brent's localmin (Brent 1973, ch. 5) on `[a, b]` from the inner point
+/// `x0` (`f(x0) = fx0`), to the tolerance `eps |x| + t`, in Brent's
+/// names: x the best point, w the second best, v the previous w.
+fn localmin(f: fn(f64) -> f64, a: f64, b: f64, x0: f64, fx0: f64, eps: f64, t: f64, max_iter: usize) -> ScalarMin {
+    let (x, w, v) = (x0, x0, x0);
+    let (fx, fw, fv) = (fx0, fx0, fx0);
+    // d is the last step, e the one before it.
+    let (d, e) = (0.0, 0.0);
+    let nfev = 0;
+    for k in 0..max_iter {
+        let m = 0.5 * (a + b);
+        let tol = eps * x.abs() + t;
+        let t2 = 2.0 * tol;
+        if (x - m).abs() <= t2 - 0.5 * (b - a) { return ScalarMin { x, fun: fx, iterations: k, nfev, status: Status::Converged }; }
+        let (p, q, r) = (0.0, 0.0, 0.0);
+        if e.abs() > tol {
+            // The parabola through v, w and x.
+            r = (x - w) * (fx - fv);
+            q = (x - v) * (fx - fw);
+            p = (x - v) * q - (x - w) * r;
+            q = 2.0 * (q - r);
+            if q > 0.0 { p = -p; } else { q = -q; }
+            r = e;
+            e = d;
+        }
+        if p.abs() < (0.5 * q * r).abs() && p > q * (a - x) && p < q * (b - x) {
+            // Its vertex, kept off the ends by t2.
+            d = p / q;
+            let u = x + d;
+            if u - a < t2 || b - u < t2 { d = if x < m { tol } else { -tol }; }
+        } else {
+            // Golden section into the larger part.
+            e = if x < m { b - x } else { a - x };
+            d = GOLDEN * e;
+        }
+        let u = x + (if d.abs() >= tol { d } else if d > 0.0 { tol } else { -tol });
+        let fu = f(u);
+        nfev += 1;
+        if fu <= fx {
+            if u < x { b = x; } else { a = x; }
+            v = w;
+            fv = fw;
+            w = x;
+            fw = fx;
+            x = u;
+            fx = fu;
+        } else {
+            if u < x { a = u; } else { b = u; }
+            if fu <= fw || w == x {
+                v = w;
+                fv = fw;
+                w = u;
+                fw = fu;
+            } else if fu <= fv || v == x || v == w {
+                v = u;
+                fv = fu;
+            }
+        }
+    }
+    ScalarMin { x, fun: fx, iterations: max_iter, nfev, status: Status::MaxIterations }
+}
+
+/// The minimum of `f` on `[lo, hi]` by Brent's method (as Brent's
+/// `fmin`, from the golden-section point), to `xtol` absolute. A
+/// minimum at an end comes back within `xtol` of it.
+///
+/// ```nabi
+/// let m = try optimize::bounded(|x: f64| -> f64 { x.sin() }, 0.0, 6.0);
+/// assert((m.x - 1.5 * f64::PI).abs() < 1e-5);
+/// let e = try optimize::bounded(|x: f64| -> f64 { x }, 1.0, 2.0);
+/// assert((e.x - 1.0).abs() < 1e-5);
+/// ```
+pub fn bounded(f: fn(f64) -> f64, lo: f64, hi: f64, xtol: f64 = 1e-5, max_iter: usize = 500) throws (OptimizeError) -> ScalarMin {
+    if !lo.is_finite() || !hi.is_finite() { throw OptimizeError::NotFinite { what: "a bound" }; }
+    if lo > hi { throw OptimizeError::BadBounds { index: 0, lo, hi }; }
+    if !(xtol > 0.0) { throw option(f"xtol = {xtol}; it must be > 0"); }
+    if lo == hi { return ScalarMin { x: lo, fun: f(lo), iterations: 0, nfev: 1, status: Status::Converged }; }
+    let x = lo + GOLDEN * (hi - lo);
+    let fx = f(x);
+    let r = localmin(f, lo, hi, x, fx, SQRT_EPS, xtol / 3.0, max_iter);
+    ScalarMin { x: r.x, fun: r.fun, iterations: r.iterations, nfev: r.nfev + 1, status: r.status }
+}
+
+/// Minimizes a scalar function: brackets a minimum from `a` and `b`,
+/// then runs `brent` in it.
+///
+/// ```nabi
+/// let m = try optimize::minimize_scalar(|x: f64| -> f64 { x ** 4 - 3.0 * x }, 0.0, 1.0);
+/// assert((m.x - 0.75f64.cbrt()).abs() < 1e-7);
+/// ```
+pub fn minimize_scalar(f: fn(f64) -> f64, a: f64 = 0.0, b: f64 = 1.0, tol: f64 = 1.4901161193847656e-8) throws (OptimizeError) -> ScalarMin {
+    let br = try bracket(f, a, b);
+    try brent(f, br, tol)
+}

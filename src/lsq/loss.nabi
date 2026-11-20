@@ -1,0 +1,97 @@
+// Robust losses for least squares: the cost is sum C^2 rho(r_i^2 / C^2)
+// / 2 with rho(z) ~ z for small z and growing slower for large z, so
+// outliers pull less. The solvers apply rho by rescaling the residuals
+// and the Jacobian (Triggs et al. 2000, as SciPy does), which keeps the
+// Gauss-Newton structure.
+
+use core::array::{Matrix, Vector};
+
+const EPS: f64 = 2.220446049250313e-16;
+
+/// The loss `rho` of the residuals, as a function of `z = r^2`.
+///
+/// ```nabi
+/// use optimize::Loss;
+///
+/// assert(Loss::Linear.rho(4.0) == 4.0);
+/// assert(Loss::Huber.rho(4.0) == 3.0);       // 2 sqrt(z) - 1 past z = 1
+/// assert(Loss::Cauchy.rho(0.0) == 0.0);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Loss {
+    /// `rho(z) = z`: ordinary least squares.
+    Linear,
+    /// `2 (sqrt(1 + z) - 1)`: a smooth L1 loss.
+    SoftL1,
+    /// `z` for `z <= 1`, `2 sqrt(z) - 1` beyond: Huber's loss.
+    Huber,
+    /// `ln(1 + z)`: Cauchy (Lorentzian); strongly downweights outliers.
+    Cauchy,
+    /// `atan(z)`: bounded, ignores far outliers almost entirely.
+    Arctan,
+}
+
+impl Loss {
+    /// `rho(z)`.
+    ///
+    /// ```nabi
+    /// assert(optimize::Loss::SoftL1.rho(3.0) == 2.0);
+    /// ```
+    pub fn rho(self, z: f64) -> f64 { self.eval(z).0 }
+
+    /// `(rho, rho', rho'')` at `z`.
+    pub(pkg) fn eval(self, z: f64) -> (f64, f64, f64) {
+        match self {
+            Loss::Linear => (z, 1.0, 0.0),
+            Loss::SoftL1 => {
+                let t = 1.0 + z;
+                let s = t.sqrt();
+                (2.0 * (s - 1.0), 1.0 / s, -0.5 / (t * s))
+            }
+            Loss::Huber => {
+                if z <= 1.0 { (z, 1.0, 0.0) } else {
+                    let s = z.sqrt();
+                    (2.0 * s - 1.0, 1.0 / s, -0.5 / (z * s))
+                }
+            }
+            Loss::Cauchy => {
+                let t = 1.0 + z;
+                (z.ln_1p(), 1.0 / t, -1.0 / (t * t))
+            }
+            Loss::Arctan => {
+                let t = 1.0 + z * z;
+                (z.atan(), 1.0 / t, -2.0 * z / (t * t))
+            }
+        }
+    }
+}
+
+/// The cost `sum C^2 rho(r^2 / C^2) / 2` of the residuals `r`.
+pub(pkg) fn cost(loss: Loss, c: f64, r: Vector<f64>) -> f64 {
+    let s = 0.0;
+    match loss {
+        Loss::Linear => {
+            for v in r { s += v * v; }
+        }
+        _ => {
+            let c2 = c * c;
+            for v in r { s += c2 * loss.eval(v * v / c2).0; }
+        }
+    }
+    0.5 * s
+}
+
+/// Rescales `r` and the rows of `j` in place for the loss, so that the
+/// Gauss-Newton model of the scaled problem matches the robust cost to
+/// second order.
+pub(pkg) fn scale(loss: Loss, c: f64, r: Vector<f64>, j: Matrix<f64>) {
+    if loss == Loss::Linear { return; }
+    let c2 = c * c;
+    for i in 0..r.len() {
+        let z = r[i] * r[i] / c2;
+        let (_, d1, d2) = loss.eval(z);
+        let js = (d1 + 2.0 * d2 * z).max(EPS).sqrt();
+        r[i] *= d1 / js;
+        j[i] .*= js;
+    }
+}

@@ -1,0 +1,190 @@
+// Trust-region Newton methods (Nocedal and Wright 2006, Algorithm 4.1):
+// minimize the quadratic model m(p) = f + g^T p + p^T B p / 2 within
+// ||p|| <= radius, accept the step when the actual decrease is at least
+// 0.15 of the predicted one, and grow or shrink the radius by that
+// ratio. Dogleg (4.1.2) needs a positive definite Hessian and solves the
+// model with one Cholesky factorization; Steihaug CG (Algorithm 7.2)
+// takes Hessian-vector products and handles indefinite Hessians.
+
+use pkg::IntoObjective;
+use pkg::error::OptimizeError;
+use pkg::minimize::{done, report, start, tiny};
+use pkg::objective::{Eval, dot, inf_norm, norm};
+use pkg::result::{Minimum, Options, Status};
+use core::array::{Array, Matrix, Vector};
+use linalg::AsVector;
+
+/// The positive `t` with `||z + t d|| = r`.
+pub(pkg) fn to_boundary(z: Vector<f64>, d: Vector<f64>, r: f64) -> f64 {
+    let a = dot(d, d);
+    let b = 2.0 * dot(z, d);
+    let c = dot(z, z) - r * r;
+    let disc = (b * b - 4.0 * a * c).max(0.0).sqrt();
+    // Stable form of the larger root.
+    if b >= 0.0 { 2.0 * c / (-b - disc) } else { (-b + disc) / (2.0 * a) }
+}
+
+fn mv(b: Matrix<f64>, v: Vector<f64>) -> Vector<f64> { b @ v }
+
+/// The dogleg step for `B` (dense) and `g` within `r`.
+fn dogleg_step(b: Matrix<f64>, g: Vector<f64>, r: f64) -> Vector<f64> {
+    let bg = mv(b, g);
+    let gbg = dot(g, bg);
+    let gg = dot(g, g);
+    // Cauchy point along -g.
+    let pu = if gbg > 0.0 { g .* (-gg / gbg) } else { g .* (-r / gg.sqrt()) };
+    let pb = try? linalg::cholesky(b);
+    if pb == none {
+        // Indefinite: shift the Hessian until it is positive definite
+        // (Nocedal and Wright, Algorithm 3.3), so the step is still a
+        // Newton-like one.
+        let n = g.len();
+        let m = 0.0;
+        for i in 0..n { m = m.max(b[i, i].abs()); }
+        let tau = 1e-3 * m.max(1e-8);
+        for _ in 0..60 {
+            pb = try? linalg::cholesky(b .+ linalg::eye::<f64>(n) .* tau);
+            if pb != none { break; }
+            tau *= 4.0;
+        }
+    }
+    let full: Vector<f64>? = match pb {
+        none => none,
+        c: linalg::Cholesky<f64> => try? c.solve(g .* -1.0),
+    };
+    match full {
+        none => {
+            // Not positive definite: the Cauchy point, clipped.
+            let un = norm(pu);
+            if un > r { pu .* (r / un) } else { pu }
+        }
+        p: Vector<f64> => {
+            if norm(p) <= r { return p; }
+            let un = norm(pu);
+            if un >= r { return pu .* (r / un); }
+            let t = to_boundary(pu, p .- pu, r);
+            pu .+ t .* (p .- pu)
+        }
+    }
+}
+
+/// The Steihaug-CG step within `r`; `tol` is the residual target.
+fn steihaug(ref ev: Eval, x: Vector<f64>, g: Vector<f64>, r: f64, tol: f64) -> Vector<f64> {
+    let n = x.len();
+    let z: Vector<f64> = Array::zeros([n]);
+    let res = g.copy();
+    let d = g .* -1.0;
+    let rr = dot(res, res);
+    if rr.sqrt() < tol { return z; }
+    for _ in 0..2 * n + 10 {
+        let bd = ev.hv(x, g, d);
+        let curv = dot(d, bd);
+        if curv <= 0.0 { return z .+ to_boundary(z, d, r) .* d; }
+        let a = rr / curv;
+        let zn = z .+ a .* d;
+        if norm(zn) >= r { return z .+ to_boundary(z, d, r) .* d; }
+        z = zn;
+        res .+= a .* bd;
+        let rr_new = dot(res, res);
+        if rr_new.sqrt() < tol { return z; }
+        d .= (rr_new / rr) .* d .- res;
+        rr = rr_new;
+    }
+    z
+}
+
+/// The trust-region subproblem solver.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Sub {
+    Dogleg,
+    Steihaug,
+}
+
+fn trust(ref ev: Eval, x: Vector<f64>, fx: f64, g: Vector<f64>, opts: Options, sub: Sub, radius: f64, name: str) -> Minimum {
+    let n = x.len();
+    let iters = opts.iters(n, 200);
+    let rmax = 1e10 * radius.max(norm(x)).max(1.0);
+    let r = radius;
+    let k = 0;
+    let status = Status::MaxIterations;
+    if inf_norm(g) <= opts.gtol { return done(ev, x, fx, g, Status::Converged, 0, name); }
+    let flat_steps = 0;
+    while k < iters {
+        k += 1;
+        let (p, bp) = match sub {
+            Sub::Dogleg => {
+                let b = ev.h(x);
+                let p = dogleg_step(b, g, r);
+                (p, mv(b, p))
+            }
+            Sub::Steihaug => {
+                let gn = norm(g);
+                let p = steihaug(ref ev, x, g, r, gn.sqrt().min(0.5) * gn);
+                (p, ev.hv(x, g, p))
+            }
+        };
+        let pred = -(dot(g, p) + 0.5 * dot(p, bp));
+        let pn = norm(p);
+        let xn = x .+ p;
+        let (fnew, gnew) = ev.fg(xn);
+        let rho = if pred > 0.0 && fnew.is_finite() { (fx - fnew) / pred } else { -1.0 };
+        if rho < 0.25 { r = 0.25 * pn.min(r); } else if rho > 0.75 && pn >= 0.99 * r { r = (2.0 * r).min(rmax); }
+        if rho > 0.15 {
+            let f_old = fx;
+            x = xn;
+            fx = fnew;
+            g = gnew;
+            if report(opts, k, x, fx, g) { status = Status::Stopped; break; }
+            if inf_norm(g) <= opts.gtol { status = Status::Converged; break; }
+            if (f_old - fx).abs() <= opts.ftol * fx.abs().max(1.0) {
+                flat_steps += 1;
+                if flat_steps >= 2 { status = Status::Converged; break; }
+            } else {
+                flat_steps = 0;
+            }
+        } else if tiny(p, x, opts.xtol) || r < 1e-15 * (1.0 + norm(x)) {
+            status = Status::Stalled;
+            break;
+        }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+    }
+    done(ev, x, fx, g, status, k, name)
+}
+
+/// Trust-region Newton with the dogleg step: one Cholesky
+/// factorization of the Hessian per iteration. For positive definite
+/// Hessians (at an indefinite one it takes the Cauchy point);
+/// quadratic convergence near a minimum. `radius` is the starting trust
+/// radius.
+///
+/// ```nabi
+/// use optimize::Objective;
+///
+/// let f = Objective::new(optimize::problems::rosen::<f64>).with_grad(optimize::problems::rosen_grad).with_hess(optimize::problems::rosen_hess);
+/// let m = try optimize::trust_dogleg(f, [-1.2, 1.0]);
+/// assert(m.success() && (m.x[0] - 1.0).abs() < 1e-6);
+/// ```
+pub fn trust_dogleg<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, radius: f64 = 1.0, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    if !(radius > 0.0) { throw OptimizeError::BadOption { what: f"radius = {radius}; it must be > 0" }; }
+    let (ev, x, fx, g) = try start(f.into_objective(), x0, true);
+    trust(ref ev, x, fx, g, opts, Sub::Dogleg, radius, "trust-region dogleg")
+}
+
+/// Trust-region Newton-CG (Steihaug): truncated CG on the model with
+/// Hessian-vector products, stopping at the trust boundary or at
+/// negative curvature. Handles indefinite Hessians and large `n`.
+///
+/// ```nabi
+/// use core::array::{Array, Vector};
+///
+/// let x0: Vector<f64> = Array::full([20], -0.5);
+/// let m = try optimize::trust_ncg(optimize::problems::rosenbrock(), x0);
+/// assert(m.success() && m.fun < 1e-10);
+/// ```
+pub fn trust_ncg<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, radius: f64 = 1.0, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    if !(radius > 0.0) { throw OptimizeError::BadOption { what: f"radius = {radius}; it must be > 0" }; }
+    let (ev, x, fx, g) = try start(f.into_objective(), x0, true);
+    trust(ref ev, x, fx, g, opts, Sub::Steihaug, radius, "trust-region Newton-CG")
+}

@@ -1,0 +1,84 @@
+// Systems F(x) = 0 from More, Garbow and Hillstrom's square problems
+// (Rosenbrock, Powell badly scaled, helical valley, Powell singular,
+// Broyden tridiagonal, discrete boundary value): every method must
+// reach |F| <= tol at a true root.
+
+use pkg::tests::suite::mgh::{helical_valley, powell_badly, powell_singular, rosenbrock};
+use pkg::tests::suite::{close, expect};
+use pkg::{Broyden, Dual, Residuals, Smooth, Status, SystemRoot};
+use core::array::{Array, Vector};
+
+fn tridiagonal<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let n = x.len();
+    let out: List<T> = [];
+    for i in 0..n {
+        let l = if i > 0 { x[i - 1] } else { T::of(0.0) };
+        let r = if i + 1 < n { x[i + 1] } else { T::of(0.0) };
+        out.push((T::of(3.0) - x[i] * 2.0) * x[i] - l - r * 2.0 + 1.0);
+    }
+    Array::view_list(out, [n])
+}
+
+fn boundary<T: Smooth>(x: Vector<T>) -> Vector<T> {
+    let n = x.len();
+    let h = 1.0 / ((n + 1) as f64);
+    let out: List<T> = [];
+    for i in 0..n {
+        let t = ((i + 1) as f64) * h;
+        let l = if i > 0 { x[i - 1] } else { T::of(0.0) };
+        let r = if i + 1 < n { x[i + 1] } else { T::of(0.0) };
+        let c = x[i] + t + 1.0;
+        out.push(x[i] * 2.0 - l - r + c * c * c * (h * h / 2.0));
+    }
+    Array::view_list(out, [n])
+}
+
+fn methods(r: Residuals, x0: Vector<f64>) -> List<SystemRoot> {
+    [try! pkg::hybr(r, x0), try! pkg::root_newton(r, x0), try! pkg::broyden(r, x0), try! pkg::broyden(r, x0, Broyden::Bad)]
+}
+
+#[test]
+fn square_systems() {
+    let x10: Vector<f64> = Array::full([10], -1.0);
+    let bv: Vector<f64> = Array::from_fn([10], |i: [usize; 1]| -> f64 { let t = ((i[0] + 1) as f64) / 11.0; t * (t - 1.0) });
+    let cases: List<(str, Residuals, Vector<f64>)> = [
+        ("rosenbrock", Residuals::dual(rosenbrock::<Dual>), [-1.2, 1.0]),
+        ("powell badly scaled", Residuals::dual(powell_badly::<Dual>), [0.0, 1.0]),
+        ("helical valley", Residuals::dual(helical_valley::<Dual>), [-1.0, 0.0, 0.0]),
+        ("broyden tridiagonal", Residuals::dual(tridiagonal::<Dual>), x10),
+        ("discrete boundary value", Residuals::dual(boundary::<Dual>), bv),
+        ("boundary value, differences", Residuals::new(boundary::<f64>), bv),
+    ];
+    let names = ["hybr", "newton", "broyden good", "broyden bad"];
+    for (name, r, x0) in cases {
+        let rs = methods(r, x0);
+        for k in 0..4 {
+            let s = rs[k];
+            // Broyden's methods have no globalization beyond the line
+            // search; from the far starts they may stall.
+            let must = k < 2 || name == "rosenbrock" || name == "broyden tridiagonal" || name.contains("boundary");
+            if must { expect(s.success(), f"{names[k]} on {name}: {s}"); }
+            if s.success() {
+                let f = r.value(s.x);
+                for v in f { close(v, 0.0, 1e-9, f"{names[k]} on {name}: F(x)"); }
+            }
+        }
+    }
+}
+
+#[test]
+fn singular_root_is_reached_slowly() {
+    // Powell singular: the Jacobian is singular at the root, Newton is
+    // only linear there, but |F| still falls below the tolerance.
+    let r = try! pkg::root_newton(powell_singular::<Dual>, [3.0, -1.0, 0.0, 1.0], tol: 1e-8);
+    expect(r.success(), f"{r}");
+}
+
+#[test]
+fn system_errors() {
+    let r = |x: Vector<f64>| -> Vector<f64> { Array::from([x[0] + x[1]]) };
+    expect((try? pkg::root(r, [1.0, 2.0])) == none, "fewer equations than unknowns");
+    expect((try? pkg::root(r, List::<f64>::new())) == none, "no unknowns");
+    let none_root = try! pkg::root(|x: Vector<f64>| -> Vector<f64> { Array::from([x[0] * x[0] + 1.0]) }, [1.0]);
+    expect(none_root.status != Status::Converged, "x^2 + 1 has no real root");
+}

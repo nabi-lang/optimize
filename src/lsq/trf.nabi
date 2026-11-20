@@ -1,0 +1,330 @@
+// Trust-region reflective least squares with bounds (Branch, Coleman
+// and Li 1999; the variant of SciPy's least_squares). The variables are
+// scaled by the Coleman-Li vector v (the distance to the bound the
+// gradient points at), the trust-region subproblem is solved exactly
+// from the SVD of the augmented scaled Jacobian, and the step is the
+// best of the truncated step, its reflection off the bound it hits, and
+// the scaled Cauchy step. Iterates stay strictly inside the box.
+
+use pkg::bound::Bounds;
+use pkg::error::OptimizeError;
+use pkg::lsq::lm::{jtv, state};
+use pkg::lsq::loss::cost;
+use pkg::lsq::{LeastSquares, LsqOptions, Residuals};
+use pkg::objective::{dot, inf_norm, norm};
+use pkg::result::Status;
+use core::array::{Array, Matrix, Vector};
+
+const EPS: f64 = 2.220446049250313e-16;
+
+fn next_toward(a: f64, b: f64) -> f64 {
+    if a == b || a != a || b != b { return a; }
+    if a == 0.0 { return if b > 0.0 { 5e-324 } else { -5e-324 }; }
+    let up = (a < b) == (a > 0.0);
+    let bits = a.to_bits();
+    f64::from_bits(if up { bits + 1 } else { bits - 1 })
+}
+
+/// `x` moved strictly inside the box: by `rstep` relative, or by one
+/// ulp for `rstep = 0`.
+fn strictly_feasible(x: Vector<f64>, b: Bounds, rstep: f64) -> Vector<f64> {
+    let y = x.copy();
+    for i in 0..y.len() {
+        let (lo, hi) = (b.lo[i], b.hi[i]);
+        let v = y[i];
+        if v <= lo { v = if rstep == 0.0 { next_toward(lo, hi) } else { lo + rstep * lo.abs().max(1.0) }; }
+        if v >= hi { v = if rstep == 0.0 { next_toward(hi, lo) } else { hi - rstep * hi.abs().max(1.0) }; }
+        if v <= lo || v >= hi { v = 0.5 * (lo + hi); }
+        y[i] = v;
+    }
+    y
+}
+
+/// The Coleman-Li scaling vector and its derivative signs.
+fn cl_scaling(x: Vector<f64>, g: Vector<f64>, b: Bounds) -> (Vector<f64>, Vector<f64>) {
+    let n = x.len();
+    let v: Vector<f64> = Array::full([n], 1.0);
+    let dv: Vector<f64> = Array::zeros([n]);
+    for i in 0..n {
+        if g[i] < 0.0 && b.hi[i] < f64::INFINITY {
+            v[i] = b.hi[i] - x[i];
+            dv[i] = -1.0;
+        } else if g[i] > 0.0 && b.lo[i] > -f64::INFINITY {
+            v[i] = x[i] - b.lo[i];
+            dv[i] = 1.0;
+        }
+    }
+    (v, dv)
+}
+
+/// The smallest step along `s` from `x` to a bound, and which
+/// variables hit it (+1 upper, -1 lower, 0 none).
+fn to_bound(x: Vector<f64>, s: Vector<f64>, b: Bounds) -> (f64, Vector<f64>) {
+    let n = x.len();
+    let steps: Vector<f64> = Array::full([n], f64::INFINITY);
+    let best = f64::INFINITY;
+    for i in 0..n {
+        if s[i] != 0.0 {
+            let t = ((b.lo[i] - x[i]) / s[i]).max((b.hi[i] - x[i]) / s[i]);
+            steps[i] = t;
+            best = best.min(t);
+        }
+    }
+    let hits: Vector<f64> = Array::zeros([n]);
+    for i in 0..n {
+        if steps[i] == best && s[i] != 0.0 { hits[i] = if s[i] > 0.0 { 1.0 } else { -1.0 }; }
+    }
+    (best, hits)
+}
+
+fn in_bounds(x: Vector<f64>, b: Bounds) -> bool {
+    for i in 0..x.len() {
+        if !(x[i] >= b.lo[i] && x[i] <= b.hi[i]) { return false; }
+    }
+    true
+}
+
+/// The two roots `t` of `||x + t s|| = delta`, ascending.
+fn intersect(x: Vector<f64>, s: Vector<f64>, delta: f64) -> (f64, f64) {
+    let a = dot(s, s);
+    let b = dot(x, s);
+    let c = dot(x, x) - delta * delta;
+    let d = (b * b - a * c).max(0.0).sqrt();
+    let q = -(b + d.copysign(b));
+    let t1 = q / a;
+    let t2 = c / q;
+    if t1 < t2 { (t1, t2) } else { (t2, t1) }
+}
+
+/// `s^T (J^T J + diag) s / 2 + g^T s`.
+fn quadratic(j: Matrix<f64>, g: Vector<f64>, s: Vector<f64>, dg: Vector<f64>) -> f64 {
+    let js = j @ s;
+    let q = dot(js, js);
+    for i in 0..s.len() { q += dg[i] * s[i] * s[i]; }
+    0.5 * q + dot(g, s)
+}
+
+/// The coefficients of `t -> model(s0 + t s) = a t^2 + b t + c`.
+fn quadratic_1d(j: Matrix<f64>, g: Vector<f64>, s: Vector<f64>, dg: Vector<f64>, s0: Vector<f64>) -> (f64, f64, f64) {
+    let v = j @ s;
+    let a = dot(v, v);
+    for i in 0..s.len() { a += dg[i] * s[i] * s[i]; }
+    a *= 0.5;
+    let b = dot(g, s);
+    let u = j @ s0;
+    b += dot(u, v);
+    let c = 0.5 * dot(u, u) + dot(g, s0);
+    for i in 0..s.len() {
+        b += dg[i] * s0[i] * s[i];
+        c += 0.5 * dg[i] * s0[i] * s0[i];
+    }
+    (a, b, c)
+}
+
+/// The minimum of `a t^2 + b t + c` on `[lo, hi]`: `(t, value)`.
+fn min_1d(a: f64, b: f64, c: f64, lo: f64, hi: f64) -> (f64, f64) {
+    let ts: List<f64> = [lo, hi];
+    if a != 0.0 {
+        let e = -0.5 * b / a;
+        if lo < e && e < hi { ts.push(e); }
+    }
+    let (bt, bv) = (lo, f64::INFINITY);
+    for t in ts {
+        let v = a * t * t + b * t + c;
+        if v < bv {
+            bv = v;
+            bt = t;
+        }
+    }
+    (bt, bv)
+}
+
+/// The exact trust-region step from the SVD `u f`, `s`, `v`
+/// (More's algorithm on the secular equation); returns the step, the
+/// LM parameter and the iterations.
+fn tr_step(n: usize, m: usize, uf: Vector<f64>, s: Vector<f64>, v: Matrix<f64>, delta: f64, alpha0: f64) -> (Vector<f64>, f64) {
+    let k = s.len();
+    let suf: Vector<f64> = Array::zeros([k]);
+    for i in 0..k { suf[i] = s[i] * uf[i]; }
+    let full = m >= n && k > 0 && s[k - 1] > EPS * (m as f64) * s[0];
+    let pfor = |alpha: f64| -> Vector<f64> {
+        let w: Vector<f64> = Array::zeros([k]);
+        for i in 0..k { w[i] = -suf[i] / (s[i] * s[i] + alpha); }
+        v @ w
+    };
+    if full {
+        let w: Vector<f64> = Array::zeros([k]);
+        for i in 0..k { w[i] = -uf[i] / s[i]; }
+        let p = v @ w;
+        if norm(p) <= delta { return (p, 0.0); }
+    }
+    let phi = |alpha: f64| -> (f64, f64) {
+        let pn2 = 0.0;
+        let d3 = 0.0;
+        for i in 0..k {
+            let den = s[i] * s[i] + alpha;
+            pn2 += suf[i] * suf[i] / (den * den);
+            d3 += suf[i] * suf[i] / (den * den * den);
+        }
+        let pn = pn2.sqrt();
+        (pn - delta, -d3 / pn)
+    };
+    let upper = norm(suf) / delta;
+    let lower = if full {
+        let (f0, d0) = phi(0.0);
+        -f0 / d0
+    } else { 0.0 };
+    let alpha = if alpha0 == 0.0 && !full { (0.001 * upper).max((lower * upper).sqrt()) } else { alpha0 };
+    for _ in 0..10 {
+        if alpha < lower || alpha > upper { alpha = (0.001 * upper).max((lower * upper).sqrt()); }
+        let (f, d) = phi(alpha);
+        if f < 0.0 { upper = alpha; }
+        let ratio = f / d;
+        lower = lower.max(alpha - ratio);
+        alpha -= (f + delta) * ratio / delta;
+        if f.abs() < 0.01 * delta { break; }
+    }
+    let p = pfor(alpha);
+    let pn = norm(p);
+    if pn > 0.0 { p .*= delta / pn; }
+    (p, alpha)
+}
+
+/// The step: the truncated trust-region step, its reflection, or the
+/// scaled Cauchy step, whichever lowers the model most.
+fn select(x: Vector<f64>, jh: Matrix<f64>, dg: Vector<f64>, gh: Vector<f64>, p0: Vector<f64>, ph0: Vector<f64>, d: Vector<f64>, delta: f64, b: Bounds, theta: f64) -> (Vector<f64>, Vector<f64>, f64) {
+    let p = p0.copy();
+    let ph = ph0.copy();
+    if in_bounds(x .+ p, b) { return (p, ph, -quadratic(jh, gh, ph, dg)); }
+    let (stride, hits) = to_bound(x, p, b);
+    let rh = ph.copy();
+    for i in 0..rh.len() {
+        if hits[i] != 0.0 { rh[i] = -rh[i]; }
+    }
+    let r = d .* rh;
+    p .*= stride;
+    ph .*= stride;
+    let xb = x .+ p;
+    let (_, to_tr) = intersect(ph, rh, delta);
+    let (tb, _) = to_bound(xb, r, b);
+    let rs = tb.min(to_tr);
+    let (rl, ru) = if rs > 0.0 { ((1.0 - theta) * stride / rs, if rs == tb { theta * tb } else { to_tr }) } else { (0.0, -1.0) };
+    let rval = f64::INFINITY;
+    if rl <= ru {
+        let (qa, qb, qc) = quadratic_1d(jh, gh, rh, dg, ph);
+        let (t, val) = min_1d(qa, qb, qc, rl, ru);
+        rh .*= t;
+        rh .+= ph;
+        r = rh .* d;
+        rval = val;
+    }
+    p .*= theta;
+    ph .*= theta;
+    let pval = quadratic(jh, gh, ph, dg);
+    let agh = gh .* -1.0;
+    let ag = d .* agh;
+    let to_tr2 = delta / norm(agh);
+    let (tb2, _) = to_bound(x, ag, b);
+    let agt = if tb2 < to_tr2 { theta * tb2 } else { to_tr2 };
+    let zero: Vector<f64> = Array::zeros([agh.len()]);
+    let (qa, qb, _) = quadratic_1d(jh, gh, agh, dg, zero);
+    let (t, agval) = min_1d(qa, qb, 0.0, 0.0, agt);
+    agh .*= t;
+    ag .*= t;
+    if pval < rval && pval < agval { (p, ph, -pval) } else if rval < pval && rval < agval { (r, rh, -rval) } else { (ag, agh, -agval) }
+}
+
+pub(pkg) fn trf(res: Residuals, x0: Vector<f64>, b: Bounds, opts: LsqOptions) throws (OptimizeError) -> LeastSquares {
+    let n = x0.len();
+    let x = strictly_feasible(b.project(x0), b, 1e-10);
+    let r = res.value(x);
+    let m = r.len();
+    if m == 0 { throw OptimizeError::ShapeMismatch { what: "the residual function returned no residuals" }; }
+    try pkg::error::finite(r, "the residuals at x0");
+    let jc = res.jac_cost(n);
+    let max_nfev = if opts.max_nfev > 0 { opts.max_nfev } else if jc > 0 { 200 * n } else { 100 * n };
+    let nfev = 1 + jc;
+    let njev = 1;
+    let (f, j, c) = state(res, x, r, opts);
+    let g = jtv(j, f);
+    let (v0, _) = cl_scaling(x, g, b);
+    let delta = 0.0;
+    for i in 0..n { delta += x[i] * x[i] / v0[i]; }
+    delta = delta.sqrt();
+    if delta == 0.0 || !delta.is_finite() { delta = 1.0; }
+    let alpha = 0.0;
+    let it = 0;
+    let status = Status::MaxEvaluations;
+    let why = "max_nfev";
+    let gnorm = 0.0;
+    let ja: Matrix<f64> = Array::zeros([m + n, n]);
+    let fa: Vector<f64> = Array::zeros([m + n]);
+    loop {
+        let (v, dv) = cl_scaling(x, g, b);
+        gnorm = inf_norm(g .* v);
+        if gnorm < opts.gtol { status = Status::Converged; why = "gtol"; break; }
+        if nfev >= max_nfev { break; }
+        let d = v .** 0.5;
+        let dg = g .* dv;
+        let gh = d .* g;
+        let jh = j .* d;
+        ja[0:m] .= jh;
+        ja[m:] .= 0.0;
+        for i in 0..n { ja[m + i, i] = dg[i].max(0.0).sqrt(); }
+        fa[0:m] .= f;
+        fa[m:] .= 0.0;
+        let sv = try linalg::svd(ja) catch e: linalg::LinalgError { throw OptimizeError::from(e); };
+        let uf = fa @ sv.u();
+        let s = sv.s();
+        let vm = sv.vt().t();
+        let theta = 0.995f64.max(1.0 - gnorm);
+        let actual = -1.0;
+        let done = false;
+        let xn = x;
+        let rn = r;
+        let cn = c;
+        while actual <= 0.0 && nfev < max_nfev {
+            let (ph, a) = tr_step(n, m, uf, s, vm, delta, alpha);
+            alpha = a;
+            let p = d .* ph;
+            let (st, sth, pred) = select(x, jh, dg, gh, p, ph, d, delta, b, theta);
+            xn = strictly_feasible(x .+ st, b, 0.0);
+            rn = res.value(xn);
+            nfev += 1;
+            let shn = norm(sth);
+            let ok = rn.len() == m;
+            if ok {
+                for e in rn { if !e.is_finite() { ok = false; } }
+            }
+            if !ok {
+                delta = 0.25 * shn;
+                continue;
+            }
+            cn = cost(opts.loss, opts.f_scale, rn);
+            actual = c - cn;
+            let ratio = if pred > 0.0 { actual / pred } else if pred == 0.0 && actual == 0.0 { 1.0 } else { 0.0 };
+            let dn = if ratio < 0.25 { 0.25 * shn } else if ratio > 0.75 && shn > 0.95 * delta { 2.0 * delta } else { delta };
+            let stn = norm(st);
+            if actual < opts.ftol * c && ratio > 0.25 { status = Status::Converged; why = "ftol"; done = true; }
+            if stn < opts.xtol * (opts.xtol + norm(x)) { status = Status::Converged; why = if done { "ftol and xtol" } else { "xtol" }; done = true; }
+            if done { break; }
+            if dn > 0.0 { alpha *= delta / dn; }
+            delta = dn;
+            if !(delta > 1e-300) { status = Status::Stalled; why = "trust radius underflow"; done = true; break; }
+        }
+        if actual > 0.0 {
+            x = xn;
+            r = rn;
+            let (f2, j2, c2) = state(res, x, r, opts);
+            f = f2;
+            j = j2;
+            c = c2;
+            nfev += jc;
+            njev += 1;
+            g = jtv(j, f);
+        }
+        it += 1;
+        if done { break; }
+    }
+    LeastSquares { x, cost: c, fun: r, jac: j, optimality: gnorm, status, iterations: it, nfev, njev, message: f"trust-region reflective: {status} ({why})" }
+}

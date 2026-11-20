@@ -1,0 +1,151 @@
+// Linear and quadratic programs with known optima: textbook LPs,
+// Beale's cycling example (Bland's rule must end it), the Klee-Minty
+// cube, a transportation problem, equality rows and free variables,
+// infeasible and unbounded problems, seeded random LPs where simplex
+// and interior point must agree, and convex QPs checked by their KKT
+// conditions.
+
+use pkg::tests::suite::{close, expect};
+use pkg::{Bounds, Lp, LpMethod, LpSolution, Qp, Status};
+use core::array::{Array, Matrix, Vector};
+use std::random::{Rng, Xoshiro256PlusPlus};
+
+fn both(lp: Lp) -> (LpSolution, LpSolution) { (try! pkg::linprog(lp), try! pkg::linprog(lp, LpMethod::InteriorPoint)) }
+
+fn feasible(r: LpSolution, tol: f64) {
+    for s in r.slack { expect(s >= -tol, f"slack {s}"); }
+    for e in r.residual { expect(e.abs() <= tol, f"equality residual {e}"); }
+}
+
+#[test]
+fn textbook_lps() {
+    let cases: List<(Lp, f64)> = [
+        (Lp::new([-3.0, -2.0]).le([[1, 1], [1, 3], [1, 0]], [4.0, 6.0, 3.0]), -11.0),
+        (Lp::new([0.6, 0.35]).ge([[5, 7], [4, 2]], [8.0, 15.0]), 2.25),
+        // Dantzig's example: max 3x1 + 5x2 with x1 <= 4, 2x2 <= 12, 3x1 + 2x2 <= 18.
+        (Lp::new([-3.0, -5.0]).le([[1, 0], [0, 2], [3, 2]], [4.0, 12.0, 18.0]), -36.0),
+        (Lp::new([-1.0, 4.0]).le([[-3, 1], [1, 2]], [6.0, 4.0]).bounds(try! Bounds::new([-f64::INFINITY, -3.0], [f64::INFINITY, f64::INFINITY])), -22.0),
+        (Lp::new([1.0, 1.0, 1.0]).eq([[1, 2, 3], [3, 2, 1]], [6.0, 6.0]), 3.0),
+        (Lp::new([2.0, -1.0]).bounds(try! Bounds::new([-1.0, -f64::INFINITY], [3.0, 5.0])), -7.0),
+    ];
+    for (lp, want) in cases {
+        let (s, p) = both(lp);
+        expect(s.success() && p.success(), f"{s} / {p}");
+        close(s.fun, want, 1e-12, "simplex optimum");
+        close(p.fun, want, 1e-7 * want.abs().max(1.0), "interior point optimum");
+        feasible(s, 1e-10);
+        feasible(p, 1e-7);
+    }
+}
+
+#[test]
+fn beale_cycling_example() {
+    // Beale (1955): Dantzig's rule cycles without an anti-cycling rule.
+    let lp = Lp::new([-0.75, 150.0, -0.02, 6.0]).le([[0.25, -60, -0.04, 9], [0.5, -90, -0.02, 3], [0, 0, 1, 0]], [0.0, 0.0, 1.0]);
+    let (s, p) = both(lp);
+    expect(s.success(), f"{s}");
+    close(s.fun, -0.05, 1e-12, "optimum");
+    close(s.x[0], 0.04, 1e-12, "x1");
+    close(s.x[2], 1.0, 1e-12, "x3");
+    close(p.fun, -0.05, 1e-7, "interior point");
+}
+
+#[test]
+fn klee_minty_cube() {
+    // max sum 2^(n-j) x_j s.t. sum_{j<i} 2^(i-j+1) x_j + x_i <= 5^i: 5^n.
+    let n = 6;
+    let a: Matrix<f64> = Array::zeros([n, n]);
+    let b: Vector<f64> = Array::zeros([n]);
+    let c: Vector<f64> = Array::zeros([n]);
+    for i in 0..n {
+        for j in 0..i { a[i, j] = 2.0f64.powi((i - j + 1) as i32); }
+        a[i, i] = 1.0;
+        b[i] = 5.0f64.powi((i + 1) as i32);
+        c[i] = -(2.0f64.powi((n - 1 - i) as i32));
+    }
+    let (s, p) = both(Lp::new(c).le(a, b));
+    close(s.fun, -(5.0f64.powi(n as i32)), 1e-8, "simplex");
+    close(p.fun, -(5.0f64.powi(n as i32)), 1e-4, "interior point");
+    close(s.x[n - 1], 5.0f64.powi(n as i32), 1e-8, "the last vertex");
+}
+
+#[test]
+fn transportation() {
+    // Two plants (supply 20, 30), three markets (demand 10, 25, 15).
+    let cost: Vector<f64> = [8.0, 6.0, 10.0, 9.0, 12.0, 13.0];
+    let lp = Lp::new(cost)
+        .le([[1, 1, 1, 0, 0, 0], [0, 0, 0, 1, 1, 1]], [20.0, 30.0])
+        .eq([[1, 0, 0, 1, 0, 0], [0, 1, 0, 0, 1, 0], [0, 0, 1, 0, 0, 1]], [10.0, 25.0, 15.0]);
+    let (s, p) = both(lp);
+    expect(s.success() && p.success(), "solved");
+    close(s.fun, 20.0 * 6.0 + 10.0 * 9.0 + 5.0 * 12.0 + 15.0 * 13.0, 1e-9, "simplex cost");
+    close(p.fun, s.fun, 1e-6, "same optimum");
+    feasible(s, 1e-10);
+}
+
+#[test]
+fn infeasible_and_unbounded() {
+    let inf = Lp::new([1.0, 1.0]).le([[1, 1]], [1.0]).ge([[1, 1]], [2.0]);
+    let (s, p) = both(inf);
+    expect(s.status == Status::Infeasible && p.status == Status::Infeasible, f"{s} / {p}");
+    let unb = Lp::new([-1.0, -1.0]).le([[1, -1]], [1.0]);
+    let (s2, p2) = both(unb);
+    expect(s2.status == Status::Unbounded && p2.status == Status::Unbounded, f"{s2} / {p2}");
+}
+
+#[test]
+fn random_lps_agree() {
+    // Feasible by construction (b = A x0 + slack, x0 >= 0) and bounded
+    // (c >= 0 on x >= 0 after adding a box).
+    let g = Xoshiro256PlusPlus::seed(5);
+    for trial in 0..6 {
+        let (m, n) = (8 + trial, 12 + 2 * trial);
+        let a: Matrix<f64> = Array::zeros([m, n]);
+        let x0: Vector<f64> = Array::zeros([n]);
+        for j in 0..n { x0[j] = g.uniform(0.0, 1.0); }
+        for i in 0..m {
+            for j in 0..n { a[i, j] = g.uniform(-1.0, 1.0); }
+        }
+        let b = (try! linalg::matvec(a, x0)) .+ 0.5;
+        let c: Vector<f64> = Array::zeros([n]);
+        for j in 0..n { c[j] = g.uniform(-1.0, 1.0); }
+        let lp = Lp::new(c).le(a, b).bounds(try! Bounds::uniform(n, 0.0, 2.0));
+        let (s, p) = both(lp);
+        expect(s.success() && p.success(), f"trial {trial}: {s.message} / {p.message}");
+        close(p.fun, s.fun, 1e-6 * s.fun.abs().max(1.0), f"trial {trial} optimum");
+        feasible(s, 1e-9);
+        for v in s.x { expect(v >= -1e-12 && v <= 2.0 + 1e-12, "in the box"); }
+    }
+}
+
+#[test]
+fn convex_qp_kkt() {
+    // min x^T Q x / 2 + c^T x s.t. A x <= b: check stationarity with the
+    // multipliers recovered on the active rows, against auglag's answer.
+    let qp = Qp::new([[4, 1, 0], [1, 3, 1], [0, 1, 2]], [-1.0, -2.0, 3.0]).le([[1, 1, 1], [-1, 0, 1]], [1.0, 0.5]).bounds(try! Bounds::uniform(3, -1.0, 1.0));
+    let r = try! pkg::quadprog(qp);
+    expect(r.success(), f"{r}");
+    let q: Matrix<f64> = [[4, 1, 0], [1, 3, 1], [0, 1, 2]];
+    let c: Vector<f64> = [-1.0, -2.0, 3.0];
+    let f = |x: Vector<f64>| -> f64 { 0.5 * (try! linalg::dot(x, try! linalg::matvec(q, x))) + (try! linalg::dot(c, x)) };
+    let cons = [
+        pkg::Constraint::le(|x: Vector<f64>| -> f64 { x[0] + x[1] + x[2] }, 1.0),
+        pkg::Constraint::le(|x: Vector<f64>| -> f64 { x[2] - x[0] }, 0.5),
+    ];
+    let al = try! pkg::auglag(f, [0.0, 0.0, 0.0], cons, bounds: try! Bounds::uniform(3, -1.0, 1.0));
+    close(r.fun, al.fun, 1e-7, "quadprog and auglag agree");
+    // x[1] sits on its bound with a zero multiplier (no strict
+    // complementarity), so both reach it only to about sqrt(tol).
+    for i in 0..3 { close(r.x[i], al.x[i], 5e-4, f"x[{i}]"); }
+    feasible(r, 1e-8);
+}
+
+#[test]
+fn qp_unconstrained_is_a_solve() {
+    let qp = Qp::new([[2, 1], [1, 2]], [-1.0, -1.0]);
+    let r = try! pkg::quadprog(qp);
+    close(r.x[0], 1.0 / 3.0, 1e-8, "Q x = -c");
+    close(r.x[1], 1.0 / 3.0, 1e-8, "Q x = -c");
+    expect((try? pkg::quadprog(Qp::new([[1, 2], [0, 1]], [0.0, 0.0]))) == none, "an asymmetric Q is refused");
+    expect((try? pkg::linprog(Lp::new([1.0, 2.0]).le([[1, 1, 1]], [1.0]))) == none, "a row of the wrong length is refused");
+}

@@ -1,0 +1,176 @@
+// What a run gives back, and the options every multivariate solver
+// shares.
+
+use pkg::line::LineSearch;
+use core::array::Vector;
+
+/// Why a run stopped.
+///
+/// ```nabi
+/// use optimize::Status;
+///
+/// assert(Status::Converged.success());
+/// assert(!Status::MaxIterations.success());
+/// assert(f"{Status::MaxIterations}".contains("max_iter"));
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Status {
+    /// A tolerance was met.
+    Converged,
+    /// `max_iter` iterations ran out.
+    MaxIterations,
+    /// `max_eval` function evaluations ran out.
+    MaxEvaluations,
+    /// No step along the search direction lowered `f` enough; usually
+    /// the gradient is wrong or the precision of `f` is used up.
+    LineSearchFailed,
+    /// The callback asked to stop.
+    Stopped,
+    /// The function gave NaN or an infinity.
+    NotFinite,
+    /// No point satisfies the constraints.
+    Infeasible,
+    /// The objective has no lower bound on the feasible set.
+    Unbounded,
+    /// No more progress: steps and decreases fell below the
+    /// tolerances while the gradient test was not met.
+    Stalled,
+}
+
+impl Status {
+    /// Whether the run reached a tolerance.
+    ///
+    /// ```nabi
+    /// assert(optimize::Status::Converged.success());
+    /// ```
+    pub fn success(self) -> bool { self == Status::Converged }
+}
+
+impl Display for Status {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        let s = match self {
+            Status::Converged => "converged",
+            Status::MaxIterations => "stopped after max_iter iterations; raise `max_iter` or loosen the tolerances",
+            Status::MaxEvaluations => "stopped after max_eval evaluations; raise `max_eval`",
+            Status::LineSearchFailed => "the line search found no step that lowers f enough; check the gradient with `check_grad`, or loosen `gtol`",
+            Status::Stopped => "stopped by the callback",
+            Status::NotFinite => "the function gave NaN or infinity; bound the variables or start elsewhere",
+            Status::Infeasible => "no point satisfies the constraints",
+            Status::Unbounded => "the objective is unbounded below on the feasible set",
+            Status::Stalled => "no further progress: the steps and decreases are below xtol and ftol",
+        };
+        try f.write_str(s)
+    }
+}
+
+/// One iteration, as the callback sees it.
+///
+/// ```nabi
+/// use optimize::{Options, Step};
+///
+/// let o = Options { callback: |s: Step| -> bool { s.iteration >= 3 } };
+/// let m = try optimize::bfgs(optimize::problems::rosenbrock(), [-1.2, 1.0], o);
+/// assert(m.status == optimize::Status::Stopped && m.iterations == 3);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Step {
+    /// The iteration just finished, from 1.
+    pub iteration: usize;
+    /// The current point.
+    pub x: Vector<f64>;
+    /// `f(x)`.
+    pub fun: f64;
+    /// `||grad f(x)||_inf`, or NaN for a method without gradients.
+    pub gnorm: f64;
+}
+
+/// Tolerances and limits for the multivariate solvers. Every field has
+/// a default, so write only what you change: `Options { gtol: 1e-10 }`.
+///
+/// ```nabi
+/// use optimize::Options;
+///
+/// let o = Options { gtol: 1e-10, max_iter: 50 };
+/// let m = try optimize::lbfgs(optimize::problems::rosenbrock(), [-1.2, 1.0], o);
+/// assert(m.iterations <= 50);
+/// ```
+pub struct Options {
+    /// Stop when `||grad f||_inf <= gtol` (gradient methods).
+    pub gtol: f64 = 1e-6;
+    /// Stop when `f` falls by less than `ftol * max(1, |f|)` in an
+    /// iteration (and, for the simplex methods, when the values
+    /// spread less than that).
+    pub ftol: f64 = 1e-12;
+    /// Stop when a step changes `x` by less than `xtol * (1 + ||x||)`.
+    pub xtol: f64 = 1e-12;
+    /// The iteration limit; 0 picks the method's default (`200 n` for
+    /// most, `1000 n` for the simplex methods).
+    pub max_iter: usize = 0;
+    /// The function-evaluation limit; 0 means none.
+    pub max_eval: usize = 0;
+    /// The line search of the gradient methods.
+    pub line_search: LineSearch = LineSearch::MoreThuente;
+    /// The memory of `lbfgs` and `lbfgsb` (pairs kept).
+    pub memory: usize = 10;
+    /// Called after every iteration; return `true` to stop.
+    pub callback: fn(Step) -> bool | none = none;
+}
+
+impl Options {
+    pub(pkg) fn iters(self, n: usize, per: usize) -> usize { if self.max_iter == 0 { (per * n).max(100) } else { self.max_iter } }
+
+    pub(pkg) fn evals_out(self, nfev: usize) -> bool { self.max_eval > 0 && nfev >= self.max_eval }
+
+    /// Calls the callback, if any; `true` to stop.
+    pub(pkg) fn stop(self, s: Step) -> bool {
+        match self.callback {
+            none => false,
+            cb: fn(Step) -> bool => cb(s),
+        }
+    }
+}
+
+/// The result of a minimization.
+///
+/// ```nabi
+/// let m = try optimize::bfgs(optimize::problems::rosenbrock(), [-1.2, 1.0]);
+/// assert(m.success());
+/// assert((m.x[0] - 1.0).abs() < 1e-5 && m.fun < 1e-10);
+/// println(f"{m}");     // status, f, iterations and evaluations
+/// ```
+#[derive(Clone, Debug)]
+pub struct Minimum {
+    /// The best point found.
+    pub x: Vector<f64>;
+    /// `f(x)`.
+    pub fun: f64;
+    /// The gradient at `x` (empty for methods without gradients).
+    pub grad: Vector<f64>;
+    /// Why the run stopped.
+    pub status: Status;
+    /// Iterations taken.
+    pub iterations: usize;
+    /// Function evaluations, finite-difference ones included.
+    pub nfev: usize;
+    /// Gradient evaluations (given or by AD).
+    pub ngev: usize;
+    /// Hessian evaluations (or Hessian-vector products).
+    pub nhev: usize;
+    /// `status` in words, with the method's detail.
+    pub message: str;
+}
+
+impl Minimum {
+    /// Whether the run converged.
+    ///
+    /// ```nabi
+    /// assert((try optimize::nelder_mead(optimize::problems::booth::<f64>, [0.0, 0.0])).success());
+    /// ```
+    pub fn success(self) -> bool { self.status.success() }
+}
+
+impl Display for Minimum {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        try f.write_str(f"{self.message}: f = {self.fun} at x = {self.x:?} after {self.iterations} iterations ({self.nfev} f, {self.ngev} grad, {self.nhev} hess evaluations)")
+    }
+}

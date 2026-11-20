@@ -1,0 +1,4 @@
+// Scalar problems: roots and minima of f: R -> R.
+
+pub mod min;
+pub mod root;

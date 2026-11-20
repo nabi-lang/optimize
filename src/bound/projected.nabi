@@ -1,0 +1,88 @@
+// Spectral projected gradient (Birgin, Martinez and Raydan 2000, SPG2):
+// steps along P(x - l g) - x with the Barzilai-Borwein step length l and
+// a nonmonotone Armijo search over the last 10 values. Only gradients
+// and projections, so each iteration is O(n); works for any box.
+
+use pkg::IntoObjective;
+use pkg::bound::{Bounds, pgrad};
+use pkg::error::OptimizeError;
+use pkg::minimize::{done, report, start, tiny};
+use pkg::objective::{dot, inf_norm};
+use pkg::result::{Minimum, Options, Status};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// Projected gradient descent on a box with Barzilai-Borwein steps and
+/// a nonmonotone line search (SPG). Simple and cheap per iteration;
+/// `lbfgsb` usually needs fewer iterations on smooth problems.
+///
+/// ```nabi
+/// use optimize::Bounds;
+/// use core::array::Vector;
+///
+/// let f = |x: Vector<f64>| -> f64 { (x[0] - 3.0) ** 2 + (x[1] + 1.0) ** 2 };
+/// let b = try Bounds::uniform(2, 0.0, 2.0);
+/// let m = try optimize::projected_gradient(f, [1.0, 1.0], b);
+/// assert(m.success() && (m.x[0] - 2.0).abs() < 1e-8 && m.x[1] == 0.0);
+/// ```
+pub fn projected_gradient<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, bounds: Bounds, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    try bounds.fits(x0.len());
+    let (ev, x, fx, g) = try start(f.into_objective(), bounds.project(x0), true);
+    let n = x.len();
+    let iters = opts.iters(n, 1000);
+    let (lmin, lmax) = (1e-30, 1e30);
+    let pg = pgrad(bounds, x, g);
+    let lam = (1.0 / inf_norm(pg).max(1e-300)).max(lmin).min(lmax);
+    let hist: List<f64> = [fx];
+    let k = 0;
+    let status = Status::MaxIterations;
+    let name = "projected gradient";
+    if inf_norm(pg) <= opts.gtol { return done(ev, x, fx, g, Status::Converged, 0, name); }
+    while k < iters {
+        let d = bounds.project(x .- lam .* g) .- x;
+        let delta = dot(g, d);
+        let fmax = hist.max() ?? fx;
+        let a = 1.0;
+        let xn = x;
+        let fnew = fx;
+        let ok = false;
+        for _ in 0..60 {
+            xn = x .+ a .* d;
+            fnew = ev.f(xn);
+            if fnew.is_finite() && fnew <= fmax + 1e-4 * a * delta {
+                ok = true;
+                break;
+            }
+            let at = if fnew.is_finite() { -0.5 * a * a * delta / (fnew - fx - a * delta) } else { 0.1 * a };
+            a = if at >= 0.1 && at <= 0.9 * a { at } else { 0.5 * a };
+        }
+        if !ok {
+            // A Barzilai-Borwein step can be wild; retry once from the
+            // scaled steepest-descent length.
+            let fresh = (1.0 / inf_norm(pgrad(bounds, x, g)).max(1e-300)).max(lmin).min(lmax);
+            if lam != fresh {
+                lam = fresh;
+                continue;
+            }
+            status = Status::LineSearchFailed;
+            break;
+        }
+        let gn = ev.g(xn);
+        let s = xn .- x;
+        let y = gn .- g;
+        x = xn;
+        fx = fnew;
+        g = gn;
+        k += 1;
+        hist.push(fx);
+        if hist.len() > 10 { _ = hist.remove(0); }
+        if report(opts, k, x, fx, g) { status = Status::Stopped; break; }
+        if inf_norm(pgrad(bounds, x, g)) <= opts.gtol { status = Status::Converged; break; }
+        if tiny(s, x, opts.xtol) { status = Status::Stalled; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+        let sy = dot(s, y);
+        lam = if sy <= 0.0 { (1.0 / inf_norm(pgrad(bounds, x, g)).max(1e-300)).max(lmin).min(lmax) } else { (dot(s, s) / sy).max(lmin).min(lmax) };
+    }
+    done(ev, x, fx, g, status, k, name)
+}

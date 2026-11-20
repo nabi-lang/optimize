@@ -1,0 +1,68 @@
+// The notation: dual-number literals and operators, the constraint
+// relations and their precedence, ∇ and ∂, ∈ on bounds, pipes.
+
+use pkg::ops::{∂, ∇};
+use pkg::tests::suite::{close, expect};
+use pkg::{Bounds, Constraint, Dual};
+use core::array::Vector;
+
+#[test]
+fn epsilon_literal() {
+    let x = 2.0 + 1.0ε;
+    expect(x == Dual::var(2.0), "2 + 1ε is the variable 2");
+    let y = x ** 3 - 4.0 * x + √x;
+    close(y.du, 12.0 - 4.0 + 0.5 / 2.0f64.sqrt(), 1e-15, "derivative through the literal");
+    expect(0.5ε == Dual::new(0.0, 0.5) && (3.0 * 1.0ε).du == 3.0, "scaled infinitesimals");
+    expect((1.0ε * 1.0ε).du == 0.0, "ε^2 = 0");
+}
+
+#[test]
+fn relation_precedence() {
+    let c = |x: Vector<f64>| -> f64 { x[0] + x[1] };
+    let k = 1.5;
+    // ⩽ binds like <=: the right side is the whole sum.
+    let a = c ⩽ k + 0.5;
+    let b = Constraint::le(c, 2.0);
+    let x: Vector<f64> = [2.0, 1.0];
+    close(a.violation(x), b.violation(x), 0.0, "c ⩽ k + 0.5 is c ⩽ (k + 0.5)");
+    close((c ⩾ 2.0 * k).violation([1.0, 1.0]), 1.0, 0.0, "⩾ with a product on the right");
+    close((c ≐ k - 0.5).violation([0.25, 0.25]), 0.5, 0.0, "≐");
+    let d = |x: Vector<Dual>| -> Dual { x[0] * x[1] };
+    close((d ⩾ 1.0).violation([0.5, 1.0]), 0.5, 0.0, "a constraint over dual numbers");
+    let r = try! pkg::minimize(|x: Vector<f64>| -> f64 { (x[0] - 2.0) ** 2 + (x[1] - 2.0) ** 2 }, [0.0, 0.0], constraints: [c ⩽ 1.0]);
+    close(r.x[0], 0.5, 1e-6, "projected onto x + y <= 1");
+    // Closures that capture data, and an `Objective`.
+    let w: Vector<f64> = [1.0, 2.0];
+    let e = |x: Vector<f64>| -> f64 { w[0] * x[0] + w[1] * x[1] };
+    let ed = |x: Vector<Dual>| -> Dual { x[0] * w[0] + x[1] * w[1] };
+    let at: Vector<f64> = [1.0, 1.0];
+    close((e ⩽ 1.0).violation(at), 2.0, 0.0, "a capturing closure");
+    close((ed ⩽ 1.0).violation(at), 2.0, 0.0, "a capturing closure over dual numbers");
+    close(Constraint::le(e, 1.0).violation(at), 2.0, 0.0, "Constraint::le of the same closure");
+    close((pkg::Objective::new(e) ≐ 3.0).violation(at), 0.0, 0.0, "an Objective");
+}
+
+#[test]
+fn nabla_and_partial() {
+    let g = ∇(pkg::problems::rosen::<Dual>);
+    let v = g([-1.2, 1.0]);
+    let w = pkg::problems::rosen_grad([-1.2, 1.0]);
+    close(v[0], w[0], 1e-12, "∇ rosen [0]");
+    close(v[1], w[1], 1e-12, "∇ rosen [1]");
+    close(∂(|x: Dual| -> Dual { x.exp() * x })(0.0), 1.0, 0.0, "∂");
+    let r = ∇(pkg::problems::rosen::<pkg::Var>)([-1.2, 1.0]);
+    close(r[0], w[0], 1e-12, "∇ rosen over Var [0]");
+    close(r[1], w[1], 1e-12, "∇ rosen over Var [1]");
+}
+
+#[test]
+fn membership_and_pipes() {
+    let b = try! Bounds::uniform(2, -1.0, 1.0);
+    let x: Vector<f64> = [0.5, -1.0];
+    let y: Vector<f64> = [0.5, -1.5];
+    expect(x ∈ b && y ∉ b, "∈ and ∉ on a box");
+    let m = try! pkg::problems::rosenbrock() |> pkg::lbfgs([-1.2, 1.0]);
+    expect(m.success(), "f |> lbfgs(x0)");
+    let r = try! (|x: f64| -> f64 { x * x - 2.0 }) |> pkg::brentq(0.0, 2.0);
+    close(r.x, 2.0f64.sqrt(), 1e-12, "f |> brentq(a, b)");
+}

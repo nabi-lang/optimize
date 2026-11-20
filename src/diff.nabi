@@ -1,0 +1,252 @@
+// Finite differences. Steps follow Nocedal and Wright (8.1): forward
+// h = sqrt(eps) max(1, |x|), error O(sqrt(eps)); central h = cbrt(eps)
+// max(1, |x|), error O(eps^(2/3)); the complex step f'(x) = Im f(x + ih)
+// / h has no cancellation, so h = 1e-20 is exact to rounding.
+
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+const SQRT_EPS: f64 = 1.4901161193847656e-8;
+const CBRT_EPS: f64 = 6.055454452393343e-6;
+const QRT_EPS: f64 = 1.220703125e-4;
+
+/// A finite-difference scheme.
+///
+/// ```nabi
+/// use optimize::Diff;
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1.0];
+/// let f = |x: Vector<f64>| -> f64 { x[0] ** 3 };
+/// let fw = optimize::approx_grad(f, x, Diff::Forward)[0];
+/// let ce = optimize::approx_grad(f, x, Diff::Central)[0];
+/// assert((ce - 3.0).abs() < (fw - 3.0).abs());
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Diff {
+    /// `(f(x + h) - f(x)) / h`: one evaluation per variable, about 8
+    /// correct digits.
+    Forward,
+    /// `(f(x + h) - f(x - h)) / 2h`: two evaluations per variable,
+    /// about 10 to 11 correct digits.
+    Central,
+}
+
+fn step(x: f64, base: f64) -> f64 {
+    let h = base * x.abs().max(1.0);
+    // Make x + h exactly representable so the divided difference uses
+    // the step actually taken.
+    let t = x + h;
+    t - x
+}
+
+/// The gradient of `f` at `x` by finite differences (`n` or `2n`
+/// evaluations, plus `f(x)` for `Forward`).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1.0, 2.0];
+/// let g = optimize::approx_grad(|x: Vector<f64>| -> f64 { x[0] * x[1] }, x);
+/// assert((g[0] - 2.0).abs() < 1e-9 && (g[1] - 1.0).abs() < 1e-9);
+/// ```
+pub fn approx_grad(f: fn(Vector<f64>) -> f64, x: Vector<f64>, scheme: Diff = Diff::Central) -> Vector<f64> {
+    let n = x.len();
+    let g: Vector<f64> = Array::zeros([n]);
+    let xs = x.copy();
+    match scheme {
+        Diff::Forward => {
+            let f0 = f(xs);
+            for i in 0..n {
+                let xi = xs[i];
+                let h = step(xi, SQRT_EPS);
+                xs[i] = xi + h;
+                g[i] = (f(xs) - f0) / h;
+                xs[i] = xi;
+            }
+        }
+        Diff::Central => {
+            for i in 0..n {
+                let xi = xs[i];
+                let h = step(xi, CBRT_EPS);
+                xs[i] = xi + h;
+                let fp = f(xs);
+                xs[i] = xi - h;
+                let fm = f(xs);
+                xs[i] = xi;
+                g[i] = (fp - fm) / (2.0 * h);
+            }
+        }
+    }
+    g
+}
+
+/// The gradient of `f` at `x` by the complex step: `f` written over
+/// `Complex<f64>` (see `Smooth`), `n` evaluations, exact to rounding.
+///
+/// ```nabi
+/// use optimize::Smooth;
+/// use core::array::Vector;
+/// use core::num::Complex;
+///
+/// fn f<T: Smooth>(x: Vector<T>) -> T { x[0].exp() / (x[1].sin() + T::of(2.0)) }
+///
+/// let x: Vector<f64> = [0.5, 1.0];
+/// let g = optimize::complex_step_grad(f::<Complex<f64>>, x);
+/// let want = 0.5f64.exp() / (1.0f64.sin() + 2.0);
+/// assert((g[0] - want).abs() < 1e-15);
+/// ```
+pub fn complex_step_grad(f: fn(Vector<Complex<f64>>) -> Complex<f64>, x: Vector<f64>) -> Vector<f64> {
+    let n = x.len();
+    let h = 1e-20;
+    let g: Vector<f64> = Array::zeros([n]);
+    let xs: Vector<Complex<f64>> = Array::from_fn([n], |ix: [usize; 1]| -> Complex<f64> { Complex::new(x[ix[0]], 0.0) });
+    for i in 0..n {
+        xs[i] = Complex::new(x[i], h);
+        g[i] = f(xs).im / h;
+        xs[i] = Complex::new(x[i], 0.0);
+    }
+    g
+}
+
+/// The Jacobian (`m x n`) of a vector function at `x` by finite
+/// differences.
+///
+/// ```nabi
+/// use core::array::{Array, Vector};
+///
+/// let f = |x: Vector<f64>| -> Vector<f64> { Array::from([x[0] * x[1], x[0] - x[1]]) };
+/// let x: Vector<f64> = [2.0, 3.0];
+/// let j = optimize::approx_jacobian(f, x);
+/// assert((j[0, 0] - 3.0).abs() < 1e-9 && (j[1, 1] + 1.0).abs() < 1e-9);
+/// ```
+pub fn approx_jacobian(f: fn(Vector<f64>) -> Vector<f64>, x: Vector<f64>, scheme: Diff = Diff::Forward) -> Matrix<f64> {
+    let f0 = f(x);
+    jacobian_at(f, x, f0, scheme)
+}
+
+/// `approx_jacobian` when `f(x) = f0` is known (saves one evaluation
+/// for `Forward`).
+pub(pkg) fn jacobian_at(f: fn(Vector<f64>) -> Vector<f64>, x: Vector<f64>, f0: Vector<f64>, scheme: Diff) -> Matrix<f64> {
+    let n = x.len();
+    let m = f0.len();
+    let j: Matrix<f64> = Array::zeros([m, n]);
+    let xs = x.copy();
+    for k in 0..n {
+        let xk = xs[k];
+        match scheme {
+            Diff::Forward => {
+                let h = step(xk, SQRT_EPS);
+                xs[k] = xk + h;
+                let fp = f(xs);
+                for i in 0..m { j[i, k] = (fp[i] - f0[i]) / h; }
+            }
+            Diff::Central => {
+                let h = step(xk, CBRT_EPS);
+                xs[k] = xk + h;
+                let fp = f(xs);
+                xs[k] = xk - h;
+                let fm = f(xs);
+                for i in 0..m { j[i, k] = (fp[i] - fm[i]) / (2.0 * h); }
+            }
+        }
+        xs[k] = xk;
+    }
+    j
+}
+
+/// The Hessian of `f` at `x` by central second differences of `f`
+/// (`2n^2 + 1` evaluations, about 5 to 6 correct digits), symmetric.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1.0, 2.0];
+/// let h = optimize::approx_hessian(|x: Vector<f64>| -> f64 { x[0] ** 2 * x[1] }, x);
+/// assert((h[0, 0] - 4.0).abs() < 1e-5 && (h[0, 1] - 2.0).abs() < 1e-5);
+/// ```
+pub fn approx_hessian(f: fn(Vector<f64>) -> f64, x: Vector<f64>) -> Matrix<f64> {
+    let n = x.len();
+    let hs: Matrix<f64> = Array::zeros([n, n]);
+    let xs = x.copy();
+    let f0 = f(xs);
+    let steps: Vector<f64> = Array::from_fn([n], |ix: [usize; 1]| -> f64 { step(x[ix[0]], QRT_EPS) });
+    for i in 0..n {
+        let hi = steps[i];
+        let xi = xs[i];
+        xs[i] = xi + hi;
+        let fp = f(xs);
+        xs[i] = xi - hi;
+        let fm = f(xs);
+        xs[i] = xi;
+        hs[i, i] = (fp - 2.0 * f0 + fm) / (hi * hi);
+        for j in 0..i {
+            let hj = steps[j];
+            let xj = xs[j];
+            xs[i] = xi + hi;
+            xs[j] = xj + hj;
+            let fpp = f(xs);
+            xs[j] = xj - hj;
+            let fpm = f(xs);
+            xs[i] = xi - hi;
+            let fmm = f(xs);
+            xs[j] = xj + hj;
+            let fmp = f(xs);
+            xs[i] = xi;
+            xs[j] = xj;
+            let v = (fpp - fpm - fmp + fmm) / (4.0 * hi * hj);
+            hs[i, j] = v;
+            hs[j, i] = v;
+        }
+    }
+    hs
+}
+
+/// The Hessian from a gradient by central differences of `g` (`2n`
+/// gradient evaluations), symmetrized: `(J + J^T) / 2`.
+///
+/// ```nabi
+/// use core::array::{Array, Vector};
+///
+/// let g = |x: Vector<f64>| -> Vector<f64> { Array::from([2.0 * x[0] * x[1], x[0] ** 2]) };
+/// let x: Vector<f64> = [1.0, 2.0];
+/// let h = optimize::hessian_from_grad(g, x);
+/// assert((h[0, 1] - 2.0).abs() < 1e-8 && (h[0, 0] - 4.0).abs() < 1e-8);
+/// ```
+pub fn hessian_from_grad(g: fn(Vector<f64>) -> Vector<f64>, x: Vector<f64>) -> Matrix<f64> {
+    let n = x.len();
+    let j = jacobian_at(g, x, x, Diff::Central);
+    let h: Matrix<f64> = Array::zeros([n, n]);
+    for i in 0..n {
+        for k in 0..n { h[i, k] = 0.5 * (j[i, k] + j[k, i]); }
+    }
+    h
+}
+
+/// How far a gradient `g` is from central differences of `f` at `x`:
+/// `||g(x) - approx||_2 / max(1, ||approx||_2)`. Below about 1e-6
+/// the gradient is right.
+///
+/// ```nabi
+/// use core::array::{Array, Vector};
+///
+/// let f = |x: Vector<f64>| -> f64 { x[0] ** 2 + x[0] * x[1] };
+/// let good = |x: Vector<f64>| -> Vector<f64> { Array::from([2.0 * x[0] + x[1], x[0]]) };
+/// let bad = |x: Vector<f64>| -> Vector<f64> { Array::from([2.0 * x[0], x[0]]) };
+/// let x: Vector<f64> = [1.0, 2.0];
+/// assert(optimize::check_grad(f, good, x) < 1e-8);
+/// assert(optimize::check_grad(f, bad, x) > 0.1);
+/// ```
+pub fn check_grad(f: fn(Vector<f64>) -> f64, g: fn(Vector<f64>) -> Vector<f64>, x: Vector<f64>) -> f64 {
+    let a = approx_grad(f, x, Diff::Central);
+    let b = g(x);
+    let n = a.len();
+    if b.len() != n { return f64::INFINITY; }
+    let d = 0.0;
+    let s = 0.0;
+    for i in 0..n {
+        d += (a[i] - b[i]) * (a[i] - b[i]);
+        s += a[i] * a[i];
+    }
+    d.sqrt() / s.sqrt().max(1.0)
+}

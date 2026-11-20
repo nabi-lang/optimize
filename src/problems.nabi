@@ -1,0 +1,226 @@
+//! Standard test functions with known minima (More, Garbow and Hillstrom
+//! 1981; Jamil and Yang 2013). Each is generic over `Smooth`, so
+//! `rosen::<f64>` evaluates it, `rosen::<Dual>` gives exact gradients by
+//! AD and `rosen::<Complex<f64>>` by the complex step.
+
+use pkg::Objective;
+use autodiff::Smooth;
+use core::array::{Array, Matrix, Vector};
+
+/// The Rosenbrock function in `n >= 2` variables,
+/// `sum 100 (x[i+1] - x[i]^2)^2 + (1 - x[i])^2`; minimum 0 at all ones.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1.0, 1.0, 1.0];
+/// assert(optimize::problems::rosen(x) == 0.0);
+/// ```
+pub fn rosen<T: Smooth>(x: Vector<T>) -> T {
+    let s = T::of(0.0);
+    for i in 0..x.len() - 1 {
+        let a = x[i + 1] - x[i] * x[i];
+        let b = T::of(1.0) - x[i];
+        s = s + a * a * 100.0 + b * b;
+    }
+    s
+}
+
+/// The gradient of `rosen`, `O(n)`.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [-1.2, 1.0];
+/// let g = optimize::problems::rosen_grad(x);
+/// assert((g[0] + 215.6).abs() < 1e-12 && (g[1] + 88.0).abs() < 1e-12);
+/// ```
+pub fn rosen_grad(x: Vector<f64>) -> Vector<f64> {
+    let n = x.len();
+    let g: Vector<f64> = Array::zeros([n]);
+    for i in 0..n - 1 {
+        let a = x[i + 1] - x[i] * x[i];
+        g[i] += -400.0 * x[i] * a - 2.0 * (1.0 - x[i]);
+        g[i + 1] += 200.0 * a;
+    }
+    g
+}
+
+/// The Hessian of `rosen` (tridiagonal, returned dense).
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1.0, 1.0];
+/// let h = optimize::problems::rosen_hess(x);
+/// assert(h[0, 0] == 802.0 && h[0, 1] == -400.0 && h[1, 1] == 200.0);
+/// ```
+pub fn rosen_hess(x: Vector<f64>) -> Matrix<f64> {
+    let n = x.len();
+    let h: Matrix<f64> = Array::zeros([n, n]);
+    for i in 0..n - 1 {
+        h[i, i] += 1200.0 * x[i] * x[i] - 400.0 * x[i + 1] + 2.0;
+        h[i, i + 1] = -400.0 * x[i];
+        h[i + 1, i] = -400.0 * x[i];
+        h[i + 1, i + 1] += 200.0;
+    }
+    h
+}
+
+/// The product of the Hessian of `rosen` at `x` with `v`, `O(n)`.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1.0, 1.0];
+/// let v: Vector<f64> = [1.0, 0.0];
+/// assert(optimize::problems::rosen_hessp(x, v)[1] == -400.0);
+/// ```
+pub fn rosen_hessp(x: Vector<f64>, v: Vector<f64>) -> Vector<f64> {
+    let n = x.len();
+    let out: Vector<f64> = Array::zeros([n]);
+    for i in 0..n - 1 {
+        let d = 1200.0 * x[i] * x[i] - 400.0 * x[i + 1] + 2.0;
+        out[i] += d * v[i] - 400.0 * x[i] * v[i + 1];
+        out[i + 1] += -400.0 * x[i] * v[i] + 200.0 * v[i + 1];
+    }
+    out
+}
+
+/// `rosen` with its exact gradient and Hessian-vector product, the
+/// usual benchmark objective.
+///
+/// ```nabi
+/// let m = try optimize::lbfgs(optimize::problems::rosenbrock(), [-1.2, 1.0]);
+/// assert(m.success());
+/// ```
+pub fn rosenbrock() -> Objective { Objective::new(rosen::<f64>).with_grad(rosen_grad).with_hessp(rosen_hessp) }
+
+/// Booth: `(x + 2y - 7)^2 + (2x + y - 5)^2`; minimum 0 at `(1, 3)`.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1.0, 3.0];
+/// assert(optimize::problems::booth(x) == 0.0);
+/// ```
+pub fn booth<T: Smooth>(x: Vector<T>) -> T {
+    let a = x[0] + x[1] * 2.0 - 7.0;
+    let b = x[0] * 2.0 + x[1] - 5.0;
+    a * a + b * b
+}
+
+/// Beale: minimum 0 at `(3, 0.5)`.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [3.0, 0.5];
+/// assert(optimize::problems::beale(x) == 0.0);
+/// ```
+pub fn beale<T: Smooth>(x: Vector<T>) -> T {
+    let (u, v) = (x[0], x[1]);
+    let a = T::of(1.5) - u + u * v;
+    let b = T::of(2.25) - u + u * v * v;
+    let c = T::of(2.625) - u + u * v * v * v;
+    a * a + b * b + c * c
+}
+
+/// Himmelblau: `(x^2 + y - 11)^2 + (x + y^2 - 7)^2`; four minima of 0,
+/// one at `(3, 2)`.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [3.0, 2.0];
+/// assert(optimize::problems::himmelblau(x) == 0.0);
+/// ```
+pub fn himmelblau<T: Smooth>(x: Vector<T>) -> T {
+    let a = x[0] * x[0] + x[1] - 11.0;
+    let b = x[0] + x[1] * x[1] - 7.0;
+    a * a + b * b
+}
+
+/// Powell's singular function (4 variables): minimum 0 at the origin,
+/// where the Hessian is singular.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [0.0, 0.0, 0.0, 0.0];
+/// assert(optimize::problems::powell_singular(x) == 0.0);
+/// ```
+pub fn powell_singular<T: Smooth>(x: Vector<T>) -> T {
+    let a = x[0] + x[1] * 10.0;
+    let b = x[2] - x[3];
+    let c = x[1] - x[2] * 2.0;
+    let d = x[0] - x[3];
+    a * a + b * b * 5.0 + c * c * c * c + d * d * d * d * 10.0
+}
+
+/// Wood's function (4 variables): minimum 0 at all ones.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1.0, 1.0, 1.0, 1.0];
+/// assert(optimize::problems::wood(x) == 0.0);
+/// ```
+pub fn wood<T: Smooth>(x: Vector<T>) -> T {
+    let a = x[1] - x[0] * x[0];
+    let b = T::of(1.0) - x[0];
+    let c = x[3] - x[2] * x[2];
+    let d = T::of(1.0) - x[2];
+    let e = x[1] - 1.0;
+    let f = x[3] - 1.0;
+    a * a * 100.0 + b * b + c * c * 90.0 + d * d + (e * e + f * f) * 10.1 + e * f * 19.8
+}
+
+/// The sphere `sum x[i]^2`; minimum 0 at the origin.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [1.0, 2.0];
+/// assert(optimize::problems::sphere(x) == 5.0);
+/// ```
+pub fn sphere<T: Smooth>(x: Vector<T>) -> T {
+    let s = T::of(0.0);
+    for v in x { s = s + v * v; }
+    s
+}
+
+/// Rastrigin, `10 n + sum x^2 - 10 cos(2 pi x)`: many local minima,
+/// global 0 at the origin. For the global solvers.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [0.0, 0.0];
+/// assert(optimize::problems::rastrigin(x) == 0.0);
+/// ```
+pub fn rastrigin<T: Smooth>(x: Vector<T>) -> T {
+    let s = T::of(10.0 * (x.len() as f64));
+    for v in x { s = s + v * v - (v * (2.0 * f64::PI)).cos() * 10.0; }
+    s
+}
+
+/// Ackley's function: a nearly flat outer region with a deep hole,
+/// global 0 at the origin. For the global solvers.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let x: Vector<f64> = [0.0, 0.0];
+/// assert(optimize::problems::ackley(x).abs() < 1e-15);
+/// ```
+pub fn ackley<T: Smooth>(x: Vector<T>) -> T {
+    let n = x.len() as f64;
+    let s2 = T::of(0.0);
+    let sc = T::of(0.0);
+    for v in x {
+        s2 = s2 + v * v;
+        sc = sc + (v * (2.0 * f64::PI)).cos();
+    }
+    T::of(20.0 + f64::E) - ((s2 / n).sqrt() * -0.2).exp() * 20.0 - (sc / n).exp()
+}

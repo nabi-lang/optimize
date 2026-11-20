@@ -1,0 +1,371 @@
+// Roots of systems F: R^n -> R^n. Newton (with backtracking on the
+// merit |F|^2 / 2), Broyden's good and bad quasi-Newton updates
+// (Broyden 1965; the inverse update for the bad one), and Powell's
+// hybrid method (Powell 1970, as MINPACK's hybrj): a dogleg trust region
+// on |F + J p| with rank-1 Jacobian updates and a fresh Jacobian when
+// progress stalls.
+
+use pkg::IntoResiduals;
+use pkg::error::{OptimizeError, finite, shape};
+use pkg::lsq::Residuals;
+use pkg::objective::{dot, inf_norm, norm};
+use pkg::result::Status;
+use core::array::{Array, Matrix, Vector};
+use linalg::AsVector;
+
+/// A root of a system of equations.
+///
+/// ```nabi
+/// use optimize::Dual;
+/// use core::array::{Array, Vector};
+///
+/// let f = |x: Vector<Dual>| -> Vector<Dual> { Array::from([x[0] * x[0] + x[1] * x[1] - 4.0, x[0] - x[1]]) };
+/// let r = try optimize::root(f, [1.0, 0.5]);
+/// assert(r.success() && (r.x[0] - 2.0f64.sqrt()).abs() < 1e-10);
+/// ```
+#[derive(Clone, Debug)]
+pub struct SystemRoot {
+    /// The root.
+    pub x: Vector<f64>;
+    /// `F(x)`.
+    pub fun: Vector<f64>;
+    /// Why the run stopped.
+    pub status: Status;
+    /// Iterations.
+    pub iterations: usize;
+    /// Evaluations of `F`, those of difference Jacobians included.
+    pub nfev: usize;
+    /// Jacobian evaluations (or refreshes).
+    pub njev: usize;
+    /// `status` in words.
+    pub message: str;
+}
+
+impl SystemRoot {
+    /// Whether `||F(x)||_inf <= tol` was reached.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// assert((try optimize::root(|x: Vector<f64>| -> Vector<f64> { x .- 1.0 }, [0.0])).success());
+    /// ```
+    pub fn success(self) -> bool { self.status == Status::Converged }
+}
+
+impl Display for SystemRoot {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        try f.write_str(f"{self.message}: |F|_inf = {inf_norm(self.fun)} at x = {self.x:?} after {self.iterations} iterations ({self.nfev} evaluations)")
+    }
+}
+
+/// Which Broyden update.
+///
+/// ```nabi
+/// use optimize::Broyden;
+/// use core::array::Vector;
+///
+/// let f = |x: Vector<f64>| -> Vector<f64> { x .** 3.0 .- 8.0 };
+/// let r = try optimize::broyden(f, [1.5], Broyden::Bad);
+/// assert((r.x[0] - 2.0).abs() < 1e-8);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Broyden {
+    /// Broyden's first ("good") method: rank-1 updates of the Jacobian.
+    Good,
+    /// Broyden's second ("bad") method: rank-1 updates of its inverse.
+    Bad,
+}
+
+fn begin(res: Residuals, x0: Vector<f64>) throws (OptimizeError) -> (Vector<f64>, Vector<f64>) {
+    let n = x0.len();
+    if n == 0 { throw OptimizeError::Empty; }
+    try finite(x0, "x0");
+    let x = x0.copy();
+    let f = res.value(x);
+    if f.len() != n { throw shape(f"F returns {f.len()} values for {n} unknowns; a root needs as many equations as unknowns (use `least_squares` otherwise)"); }
+    try finite(f, "F(x0)");
+    (x, f)
+}
+
+/// `J p = -f` by LU, least squares when J is singular.
+fn newton_step(j: Matrix<f64>, f: Vector<f64>) -> Vector<f64>? {
+    let rhs = f .* -1.0;
+    let p = try? linalg::solve(j, rhs);
+    if p != none { return p; }
+    try? linalg::lstsq(j, rhs)
+}
+
+fn finish(x: Vector<f64>, f: Vector<f64>, status: Status, k: usize, nfev: usize, njev: usize, name: str) -> SystemRoot {
+    SystemRoot { x, fun: f, status, iterations: k, nfev, njev, message: f"{name}: {status}" }
+}
+
+/// Newton's method for `F(x) = 0` with a backtracking line search on
+/// `|F|^2 / 2`: quadratic convergence near a root with a nonsingular
+/// Jacobian. Stops when `||F||_inf <= tol`.
+///
+/// ```nabi
+/// use optimize::Dual;
+/// use core::array::{Array, Vector};
+///
+/// let f = |x: Vector<Dual>| -> Vector<Dual> { Array::from([x[0].exp() - x[1], x[0] + x[1] - 2.0]) };
+/// let r = try optimize::root_newton(f, [0.0, 0.0]);
+/// assert(r.success() && r.iterations < 10);
+/// ```
+pub fn root_newton<R: IntoResiduals, X: AsVector<f64>>(f: R, x0: X, tol: f64 = 1e-10, xtol: f64 = 1e-14, max_iter: usize = 100) throws (OptimizeError) -> SystemRoot {
+    let x0: Vector<f64> = x0.as_vector();
+    let res = f.into_residuals();
+    let (x, fx) = try begin(res, x0);
+    let n = x.len();
+    let jc = res.jac_cost(n);
+    let nfev = 1;
+    let njev = 0;
+    let name = "Newton";
+    for k in 0..max_iter {
+        if inf_norm(fx) <= tol { return finish(x, fx, Status::Converged, k, nfev, njev, name); }
+        let j = res.jacobian_at(x, fx);
+        njev += 1;
+        nfev += jc;
+        let p = match newton_step(j, fx) {
+            none => { return finish(x, fx, Status::Stalled, k, nfev, njev, name); }
+            v: Vector<f64> => v,
+        };
+        let phi = 0.5 * dot(fx, fx);
+        let t = 1.0;
+        let ok = false;
+        let xn = x;
+        let fnew = fx;
+        for _ in 0..40 {
+            xn = x .+ t .* p;
+            fnew = res.value(xn);
+            nfev += 1;
+            let pn = 0.5 * dot(fnew, fnew);
+            if pn.is_finite() && pn <= (1.0 - 2e-4 * t) * phi {
+                ok = true;
+                break;
+            }
+            t *= 0.5;
+        }
+        if !ok { return finish(x, fx, Status::LineSearchFailed, k + 1, nfev, njev, name); }
+        let step = norm(xn .- x);
+        x = xn;
+        fx = fnew;
+        if step <= xtol * (1.0 + norm(x)) {
+            let st = if inf_norm(fx) <= tol { Status::Converged } else { Status::Stalled };
+            return finish(x, fx, st, k + 1, nfev, njev, name);
+        }
+    }
+    let st = if inf_norm(fx) <= tol { Status::Converged } else { Status::MaxIterations };
+    finish(x, fx, st, max_iter, nfev, njev, name)
+}
+
+/// Broyden's quasi-Newton method: one Jacobian at the start (given,
+/// AD or differences), then rank-1 updates from each step, with a
+/// backtracking line search on `|F|`; the Jacobian is refreshed when a
+/// step fails. Superlinear near a root, one evaluation per iteration.
+///
+/// ```nabi
+/// use optimize::Broyden;
+/// use core::array::{Array, Vector};
+///
+/// let f = |x: Vector<f64>| -> Vector<f64> { Array::from([x[0] + 0.5 * (x[0] - x[1]) ** 3 - 1.0, 0.5 * (x[1] - x[0]) ** 3 + x[1]]) };
+/// let r = try optimize::broyden(f, [0.0, 0.0], Broyden::Good);
+/// assert(r.success() && (r.x[0] - 0.8411639).abs() < 1e-6);
+/// ```
+pub fn broyden<R: IntoResiduals, X: AsVector<f64>>(f: R, x0: X, kind: Broyden = Broyden::Good, tol: f64 = 1e-10, xtol: f64 = 1e-14, max_iter: usize = 200) throws (OptimizeError) -> SystemRoot {
+    let x0: Vector<f64> = x0.as_vector();
+    let res = f.into_residuals();
+    let (x, fx) = try begin(res, x0);
+    let n = x.len();
+    let jc = res.jac_cost(n);
+    let nfev = 1;
+    let njev = 0;
+    let name = match kind { Broyden::Good => "Broyden (good)", Broyden::Bad => "Broyden (bad)" };
+    let j = res.jacobian_at(x, fx);
+    njev += 1;
+    nfev += jc;
+    let h: Matrix<f64> = try? linalg::inv(j) ?? linalg::eye(n);
+    let fresh = true;
+    for k in 0..max_iter {
+        if inf_norm(fx) <= tol { return finish(x, fx, Status::Converged, k, nfev, njev, name); }
+        let p: Vector<f64> = match kind {
+            Broyden::Good => match newton_step(j, fx) { none => fx .* -1.0, v: Vector<f64> => v },
+            Broyden::Bad => (h @ fx) .* -1.0,
+        };
+        let fn0 = norm(fx);
+        let t = 1.0;
+        let ok = false;
+        let xn = x;
+        let fnew = fx;
+        for _ in 0..20 {
+            xn = x .+ t .* p;
+            fnew = res.value(xn);
+            nfev += 1;
+            let nn = norm(fnew);
+            if nn.is_finite() && nn <= (1.0 - 1e-4 * t) * fn0 {
+                ok = true;
+                break;
+            }
+            t *= 0.5;
+        }
+        if !ok {
+            if fresh { return finish(x, fx, Status::LineSearchFailed, k + 1, nfev, njev, name); }
+            // The secant estimate went bad: start again from a true one.
+            j = res.jacobian_at(x, fx);
+            h = try? linalg::inv(j) ?? linalg::eye(n);
+            njev += 1;
+            nfev += jc;
+            fresh = true;
+            continue;
+        }
+        let s = xn .- x;
+        let y = fnew .- fx;
+        x = xn;
+        fx = fnew;
+        fresh = false;
+        if norm(s) <= xtol * (1.0 + norm(x)) {
+            let st = if inf_norm(fx) <= tol { Status::Converged } else { Status::Stalled };
+            return finish(x, fx, st, k + 1, nfev, njev, name);
+        }
+        match kind {
+            Broyden::Good => {
+                let ss = dot(s, s);
+                if ss > 0.0 {
+                    let u = (y .- j @ s) ./ ss;
+                    for i in 0..n { j[i] .+= u[i] .* s; }
+                }
+            }
+            Broyden::Bad => {
+                let yy = dot(y, y);
+                if yy > 0.0 {
+                    let u = (s .- h @ y) ./ yy;
+                    for i in 0..n { h[i] .+= u[i] .* y; }
+                }
+            }
+        }
+    }
+    let st = if inf_norm(fx) <= tol { Status::Converged } else { Status::MaxIterations };
+    finish(x, fx, st, max_iter, nfev, njev, name)
+}
+
+/// Powell's hybrid method: a dogleg step between Gauss-Newton and
+/// steepest descent on `|F + J p|` inside a scaled trust region,
+/// Broyden updates of `J` between fresh Jacobians. As robust as the
+/// trust region, as fast as Newton near a root; the default of `root`.
+///
+/// ```nabi
+/// use optimize::Dual;
+/// use core::array::{Array, Vector};
+///
+/// // Powell's badly scaled function: root near (1.098e-5, 9.106).
+/// let f = |x: Vector<Dual>| -> Vector<Dual> { Array::from([x[0] * x[1] * 1e4 - 1.0, (-x[0]).exp() + (-x[1]).exp() - 1.0001]) };
+/// let r = try optimize::hybr(f, [0.0, 1.0]);
+/// assert(r.success() && (r.x[1] - 9.106146739867).abs() < 1e-8);
+/// ```
+pub fn hybr<R: IntoResiduals, X: AsVector<f64>>(f: R, x0: X, tol: f64 = 1e-10, xtol: f64 = 1e-14, max_iter: usize = 200, factor: f64 = 100.0) throws (OptimizeError) -> SystemRoot {
+    let x0: Vector<f64> = x0.as_vector();
+    if !(factor > 0.0) { throw OptimizeError::BadOption { what: f"factor = {factor}; it must be > 0" }; }
+    let res = f.into_residuals();
+    let (x, fx) = try begin(res, x0);
+    let n = x.len();
+    let jc = res.jac_cost(n);
+    let nfev = 1;
+    let njev = 1;
+    let name = "hybrid Powell";
+    let j = res.jacobian_at(x, fx);
+    nfev += jc;
+    let d: Vector<f64> = Array::zeros([n]);
+    for k in 0..n {
+        let s = 0.0;
+        for i in 0..n { s += j[i, k] * j[i, k]; }
+        d[k] = if s > 0.0 { s.sqrt() } else { 1.0 };
+    }
+    let delta = factor * norm(d .* x);
+    if delta == 0.0 { delta = factor; }
+    let fails = 0;
+    let slow = 0;
+    for k in 0..max_iter {
+        if inf_norm(fx) <= tol { return finish(x, fx, Status::Converged, k, nfev, njev, name); }
+        // Dogleg in the scaled variables.
+        let gn: Vector<f64> = match newton_step(j, fx) { none => Array::zeros([n]), v: Vector<f64> => v };
+        let p: Vector<f64> = gn;
+        if norm(d .* gn) > delta {
+            let g = (fx @ j) ./ (d .* d);
+            let jg = j @ g;
+            let gnorm = norm(g .* d);
+            let alpha = dot(g .* d, g .* d) / dot(jg, jg).max(1e-300);
+            let sd = g .* (-alpha);
+            if norm(d .* sd) >= delta {
+                p = sd .* (delta / norm(d .* sd));
+            } else {
+                // Walk from the Cauchy point towards the Gauss-Newton one.
+                let a = d .* sd;
+                let b = d .* (gn .- sd);
+                let bb = dot(b, b);
+                let ab = dot(a, b);
+                let c = dot(a, a) - delta * delta;
+                let t = (-ab + (ab * ab - bb * c).max(0.0).sqrt()) / bb.max(1e-300);
+                p = sd .+ t .* (gn .- sd);
+            }
+            _ = gnorm;
+        }
+        let xn = x .+ p;
+        let fnew = res.value(xn);
+        nfev += 1;
+        let jp = j @ p;
+        let lin = fx .+ jp;
+        let actual = if fnew.len() == n { dot(fx, fx) - dot(fnew, fnew) } else { -1.0 };
+        let pred = dot(fx, fx) - dot(lin, lin);
+        let ratio = if pred > 0.0 && actual == actual { actual / pred } else { 0.0 };
+        let pn = norm(d .* p);
+        if ratio < 0.1 {
+            delta = 0.5 * delta.min(pn);
+            fails += 1;
+        } else {
+            fails = 0;
+            if ratio >= 0.5 { delta = delta.max(2.0 * pn); }
+        }
+        if ratio >= 1e-4 {
+            let prev = norm(fx);
+            x = xn;
+            let y = fnew .- fx;
+            fx = fnew;
+            slow = if norm(fx) > 0.99 * prev { slow + 1 } else { 0 };
+            if pn <= xtol * (1.0 + norm(d .* x)) {
+                let st = if inf_norm(fx) <= tol { Status::Converged } else { Status::Stalled };
+                return finish(x, fx, st, k + 1, nfev, njev, name);
+            }
+            // Broyden update along the accepted step.
+            let pp = dot(p, p);
+            if pp > 0.0 {
+                let u = (y .- jp) ./ pp;
+                for i in 0..n { j[i] .+= u[i] .* p; }
+            }
+        }
+        if fails >= 2 || slow >= 5 {
+            j = res.jacobian_at(x, fx);
+            nfev += jc;
+            njev += 1;
+            fails = 0;
+            slow = 0;
+            for c in 0..n {
+                let s = 0.0;
+                for i in 0..n { s += j[i, c] * j[i, c]; }
+                d[c] = d[c].max(s.sqrt());
+            }
+        }
+        if !(delta > 1e-300) { return finish(x, fx, Status::Stalled, k + 1, nfev, njev, name); }
+    }
+    let st = if inf_norm(fx) <= tol { Status::Converged } else { Status::MaxIterations };
+    finish(x, fx, st, max_iter, nfev, njev, name)
+}
+
+/// Solves `F(x) = 0` from `x0` by Powell's hybrid method (`hybr`).
+///
+/// ```nabi
+/// use core::array::{Array, Vector};
+///
+/// let f = |x: Vector<f64>| -> Vector<f64> { Array::from([x[0] + 2.0 * x[1] - 2.0, x[0] ** 2 + 4.0 * x[1] ** 2 - 4.0]) };
+/// let r = try optimize::root(f, [1.0, 2.0]);
+/// assert(r.success() && r.x[0].abs() < 1e-8 && (r.x[1] - 1.0).abs() < 1e-8);
+/// ```
+pub fn root<R: IntoResiduals, X: AsVector<f64>>(f: R, x0: X, tol: f64 = 1e-10) throws (OptimizeError) -> SystemRoot { try hybr(f, x0, tol) }

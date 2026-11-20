@@ -1,0 +1,91 @@
+// Box constraints: L-BFGS-B and projected gradient on problems whose
+// constrained minimum is known, starts outside the box, every point in
+// the box, and the Bounds type.
+
+use pkg::tests::suite::{close, expect};
+use pkg::{Bounds, Dual, OptimizeError, Options};
+use core::array::{Array, Vector};
+
+#[test]
+fn rosenbrock_on_a_bound() {
+    let b = try! Bounds::new([-2.0, -2.0], [0.5, 2.0]);
+    let l = try! pkg::lbfgsb(pkg::problems::rosenbrock(), [-1.2, 1.0], b);
+    let p = try! pkg::projected_gradient(pkg::problems::rosenbrock(), [-1.2, 1.0], b);
+    for r in [l, p] {
+        expect(r.success() && r.x ∈ b, f"{r}");
+        close(r.x[0], 0.5, 0.0, "x0 on its bound");
+        close(r.x[1], 0.25, 1e-5, "x1 = x0^2");
+        close(r.fun, 0.25, 1e-9, "f");
+    }
+}
+
+#[test]
+fn box_quadratic_known_solution() {
+    // min sum (x_i - c_i)^2 on [0, 1]^n: x = clip(c).
+    let n = 40;
+    let c: Vector<f64> = Array::from_fn([n], |i: [usize; 1]| -> f64 { ((i[0] as f64) - 15.0) / 10.0 });
+    let f = |x: Vector<Dual>| -> Dual {
+        let s = Dual::constant(0.0);
+        for i in 0..x.len() { s = s + (x[i] - c[i]) * (x[i] - c[i]); }
+        s
+    };
+    let b = try! Bounds::uniform(n, 0.0, 1.0);
+    let x0: Vector<f64> = Array::full([n], 5.0);
+    // A closure that captures data, as it is.
+    let l = try! pkg::lbfgsb(f, x0, b);
+    let p = try! pkg::projected_gradient(f, x0, b);
+    for r in [l, p] {
+        expect(r.success(), f"{r}");
+        for i in 0..n { close(r.x[i], c[i].max(0.0).min(1.0), 1e-7, f"x[{i}]"); }
+    }
+}
+
+#[test]
+fn large_bounded_rosenbrock() {
+    // Every other variable pushed off the unconstrained minimum.
+    let n = 100;
+    let lo: Vector<f64> = Array::full([n], -10.0);
+    let hi: Vector<f64> = Array::full([n], 10.0);
+    for i in 0..n {
+        if i % 4 == 0 { hi[i] = 0.9; }
+    }
+    let b = try! Bounds::new(lo, hi);
+    let x0: Vector<f64> = Array::full([n], -1.0);
+    let r = try! pkg::lbfgsb(pkg::problems::rosenbrock(), x0, b);
+    expect(r.success() && r.x ∈ b, f"{r.message}");
+    // First-order conditions: projected gradient zero.
+    for i in 0..n {
+        let g = r.grad[i];
+        if r.x[i] == hi[i] { expect(g <= 1e-4, f"g[{i}] = {g} at its upper bound"); } else { close(g, 0.0, 1e-4, f"g[{i}] free"); }
+    }
+}
+
+#[test]
+fn memory_sizes_and_unbounded_box() {
+    for m in [1, 3, 10, 30] {
+        let r = try! pkg::lbfgsb(pkg::problems::rosenbrock(), [-1.2, 1.0], Bounds::free(2), Options { memory: m, max_iter: 2000 });
+        expect(r.success() && r.fun < 1e-10, f"memory {m}: {r.message}");
+    }
+}
+
+#[test]
+fn bounds_type() {
+    let b = try! Bounds::ranges([0.0..=1.0, -2.0..=2.0]);
+    let x: Vector<f64> = [0.5, 3.0];
+    expect(!(x ∈ b) && b.project(x)[1] == 2.0, "project");
+    expect(b.holds([1.0, -2.0]), "closed box");
+    expect(!b.holds([1.0]), "wrong length is outside");
+    let e = try { _ = try Bounds::new([1.0, 0.0], [0.0, 1.0]); "" } catch e: OptimizeError { f"{e}" };
+    expect(e.contains("bound 0"), e);
+    expect((try? Bounds::new([0.0], [f64::NAN])) == none, "NaN bound");
+    expect((try? Bounds::new([0.0], [1.0, 2.0])) == none, "lengths differ");
+    let b3 = try! Bounds::uniform(3, 0.0, 1.0);
+    expect((try? pkg::lbfgsb(pkg::problems::rosenbrock(), [0.0, 0.0], b3)) == none, "bounds for the wrong n");
+}
+
+#[test]
+fn start_outside_is_projected() {
+    let b = try! Bounds::uniform(2, 2.0, 3.0);
+    let r = try! pkg::lbfgsb(pkg::problems::sphere::<Dual>, [-5.0, 9.0], b);
+    expect(r.x[0] == 2.0 && r.x[1] == 2.0 && r.fun == 8.0, f"{r}");
+}

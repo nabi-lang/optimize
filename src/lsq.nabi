@@ -1,0 +1,296 @@
+// Nonlinear least squares, min sum rho(r_i(x)^2) / 2, and systems of
+// equations F(x) = 0. `Residuals` carries r and its Jacobian (given, by
+// forward-mode AD, or by finite differences).
+
+pub mod fit;
+pub mod lm;
+pub mod loss;
+pub mod trf;
+
+pub use loss::Loss;
+
+use pkg::diff::{Diff, jacobian_at};
+use pkg::dual::values;
+use autodiff::{Dual, jacobian};
+use core::array::{Matrix, Vector};
+use linalg::AsVector;
+
+pub(pkg) enum Jac {
+    Approx(Diff),
+    Given(fn(Vector<f64>) -> Matrix<f64>),
+    Auto(fn(Vector<Dual>) -> Vector<Dual>),
+}
+
+/// A vector function `r: R^n -> R^m` (residuals, or the equations of a
+/// root problem) with its Jacobian. Built from a closure over `f64`
+/// (forward differences), over `Dual` (exact, `n` passes) or with
+/// `with_jac`.
+///
+/// ```nabi
+/// use optimize::Residuals;
+/// use core::array::{Array, Matrix, Vector};
+///
+/// let r = Residuals::new(|x: Vector<f64>| -> Vector<f64> { Array::from([x[0] - 1.0, 10.0 * (x[1] - x[0] ** 2)]) })
+///     .with_jac(|x: Vector<f64>| -> Matrix<f64> { Array::from_list([1.0, 0.0, -20.0 * x[0], 10.0], [2, 2]) });
+/// assert(r.jacobian([2.0, 0.0])[1, 0] == -40.0);
+/// ```
+pub struct Residuals {
+    pub(pkg) r: fn(Vector<f64>) -> Vector<f64>;
+    pub(pkg) j: Jac = Jac::Approx(Diff::Forward);
+}
+
+impl Residuals {
+    /// `r` with its Jacobian by forward differences.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let r = optimize::Residuals::new(|x: Vector<f64>| -> Vector<f64> { x .* 2.0 });
+    /// assert(r.value([1.0])[0] == 2.0);
+    /// ```
+    pub fn new(r: fn(Vector<f64>) -> Vector<f64>) -> Residuals { Residuals { r } }
+
+    /// `r` written over dual numbers: the Jacobian by forward-mode AD.
+    ///
+    /// ```nabi
+    /// use optimize::Dual;
+    /// use core::array::{Array, Vector};
+    ///
+    /// let r = optimize::Residuals::dual(|x: Vector<Dual>| -> Vector<Dual> { Array::from([x[0] * x[1]]) });
+    /// assert(r.jacobian([3.0, 4.0])[0, 1] == 3.0);
+    /// ```
+    pub fn dual(r: fn(Vector<Dual>) -> Vector<Dual>) -> Residuals {
+        Residuals { r: |x: Vector<f64>| -> Vector<f64> { values(r, x) }, j: Jac::Auto(r) }
+    }
+
+    /// With the exact Jacobian (`m x n`).
+    ///
+    /// ```nabi
+    /// use core::array::{Array, Matrix, Vector};
+    ///
+    /// let r = optimize::Residuals::new(|x: Vector<f64>| -> Vector<f64> { x .* 3.0 })
+    ///     .with_jac(|_x: Vector<f64>| -> Matrix<f64> { Array::full([1, 1], 3.0) });
+    /// assert(r.jacobian([0.0])[0, 0] == 3.0);
+    /// ```
+    pub fn with_jac(self, j: fn(Vector<f64>) -> Matrix<f64>) -> Residuals {
+        let r = self;
+        r.j = Jac::Given(j);
+        r
+    }
+
+    /// With the finite-difference scheme for the Jacobian.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let r = optimize::Residuals::new(|x: Vector<f64>| -> Vector<f64> { x .** 2.0 }).with_diff(optimize::Diff::Central);
+    /// assert((r.jacobian([1.0])[0, 0] - 2.0).abs() < 1e-9);
+    /// ```
+    pub fn with_diff(self, d: Diff) -> Residuals {
+        let r = self;
+        match r.j {
+            Jac::Approx(_) => { r.j = Jac::Approx(d); }
+            _ => {}
+        }
+        r
+    }
+
+    /// `r(x)`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// assert(optimize::Residuals::new(|x: Vector<f64>| -> Vector<f64> { x }).value([5.0])[0] == 5.0);
+    /// ```
+    pub fn value(self, x: Vector<f64>) -> Vector<f64> { (self.r)(x) }
+
+    /// The Jacobian at `x`.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// let r = optimize::Residuals::new(|x: Vector<f64>| -> Vector<f64> { x .* 4.0 });
+    /// assert((r.jacobian([1.0])[0, 0] - 4.0).abs() < 1e-6);
+    /// ```
+    pub fn jacobian(self, x: Vector<f64>) -> Matrix<f64> { self.jacobian_at(x, (self.r)(x)) }
+
+    /// The Jacobian at `x` where `r(x) = r0`, with the number of
+    /// residual evaluations it took.
+    pub(pkg) fn jacobian_at(self, x: Vector<f64>, r0: Vector<f64>) -> Matrix<f64> {
+        match self.j {
+            Jac::Approx(d) => jacobian_at(self.r, x, r0, d),
+            Jac::Given(j) => j(x),
+            Jac::Auto(f) => jacobian(f, x),
+        }
+    }
+
+    /// Residual evaluations one Jacobian costs.
+    pub(pkg) fn jac_cost(self, n: usize) -> usize {
+        match self.j {
+            Jac::Approx(Diff::Forward) => n,
+            Jac::Approx(Diff::Central) => 2 * n,
+            _ => 0,
+        }
+    }
+}
+
+/// What the least-squares and root solvers accept: `Residuals`, or a
+/// closure over `f64` (`Residuals::new`) or `Dual`
+/// (`Residuals::dual`).
+///
+/// ```nabi
+/// use optimize::{Dual, IntoResiduals};
+/// use core::array::Vector;
+///
+/// let r = (|x: Vector<Dual>| -> Vector<Dual> { x }).into_residuals();
+/// assert(r.jacobian([1.0, 2.0])[1, 1] == 1.0);
+/// ```
+pub trait IntoResiduals {
+    /// The residuals.
+    fn into_residuals(self) -> Residuals;
+}
+
+impl IntoResiduals for Residuals {
+    fn into_residuals(self) -> Residuals { self }
+}
+
+impl IntoResiduals for fn(Vector<f64>) -> Vector<f64> {
+    fn into_residuals(self) -> Residuals { Residuals::new(self) }
+}
+
+impl IntoResiduals for fn(Vector<Dual>) -> Vector<Dual> {
+    fn into_residuals(self) -> Residuals { Residuals::dual(self) }
+}
+
+/// Tolerances and limits of the least-squares solvers.
+///
+/// ```nabi
+/// use optimize::LsqOptions;
+///
+/// let o = LsqOptions { ftol: 1e-14, max_nfev: 500 };
+/// assert(o.gtol == 1e-10);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct LsqOptions {
+    /// Stop when the cost falls by less than `ftol * cost` in a
+    /// successful step.
+    pub ftol: f64 = 1e-10;
+    /// Stop when a step is below `xtol * (xtol + ||x||)`.
+    pub xtol: f64 = 1e-10;
+    /// Stop when `||J^T r||_inf <= gtol` (scaled by the distance to the
+    /// bounds for `Trf`).
+    pub gtol: f64 = 1e-10;
+    /// The residual-evaluation limit (Jacobian differences included);
+    /// 0 means `100 n` (`200 n` with difference Jacobians).
+    pub max_nfev: usize = 0;
+    /// The robust loss.
+    pub loss: Loss = Loss::Linear;
+    /// The residual scale `C` of the loss: residuals well below it count
+    /// as in plain least squares.
+    pub f_scale: f64 = 1.0;
+}
+
+/// The least-squares method.
+///
+/// ```nabi
+/// use optimize::LsqMethod;
+/// use core::array::{Array, Vector};
+///
+/// let r = |x: Vector<f64>| -> Vector<f64> { Array::from([x[0] - 2.0, x[0] * x[1] - 1.0]) };
+/// let a = try optimize::least_squares(r, [1.0, 1.0], method: LsqMethod::Lm);
+/// let b = try optimize::least_squares(r, [1.0, 1.0], method: LsqMethod::Trf);
+/// assert((a.x[1] - 0.5).abs() < 1e-8 && (b.x[1] - 0.5).abs() < 1e-8);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LsqMethod {
+    /// Levenberg-Marquardt (unbounded only); the default without bounds.
+    Lm,
+    /// Trust-region reflective; takes bounds; the default with them.
+    Trf,
+}
+
+/// The result of a least-squares fit.
+///
+/// ```nabi
+/// use core::array::Vector;
+///
+/// let r = try optimize::least_squares(|x: Vector<f64>| -> Vector<f64> { x .- 3.0 }, [0.0]);
+/// assert(r.success() && r.cost < 1e-20 && r.fun.len() == 1);
+/// ```
+#[derive(Clone, Debug)]
+pub struct LeastSquares {
+    /// The solution.
+    pub x: Vector<f64>;
+    /// The cost `sum rho(r^2) / 2` at `x`.
+    pub cost: f64;
+    /// The residuals at `x`.
+    pub fun: Vector<f64>;
+    /// The Jacobian at `x` (of the loss-scaled residuals).
+    pub jac: Matrix<f64>;
+    /// `||J^T r||_inf` at `x` (scaled for `Trf`), the first-order
+    /// optimality measure.
+    pub optimality: f64;
+    /// Why the run stopped.
+    pub status: pkg::Status;
+    /// Iterations.
+    pub iterations: usize;
+    /// Residual evaluations, those of difference Jacobians included.
+    pub nfev: usize;
+    /// Jacobian evaluations.
+    pub njev: usize;
+    /// `status` in words, with the test that stopped it.
+    pub message: str;
+}
+
+impl LeastSquares {
+    /// Whether a tolerance was met.
+    ///
+    /// ```nabi
+    /// use core::array::Vector;
+    ///
+    /// assert((try optimize::least_squares(|x: Vector<f64>| -> Vector<f64> { x }, [1.0])).success());
+    /// ```
+    pub fn success(self) -> bool { self.status == pkg::Status::Converged }
+}
+
+impl Display for LeastSquares {
+    fn fmt(self, ref f: Formatter) throws (FmtError) {
+        try f.write_str(f"{self.message}: cost = {self.cost} at x = {self.x:?} after {self.iterations} iterations ({self.nfev} residual, {self.njev} Jacobian evaluations)")
+    }
+}
+
+/// Nonlinear least squares: minimizes `sum rho(r_i(x)^2) / 2` from
+/// `x0`, by Levenberg-Marquardt without bounds and trust-region
+/// reflective with them (or as `method` says). `r` is any
+/// `IntoResiduals`: give the Jacobian, write `r` over `Dual`, or let
+/// forward differences estimate it.
+///
+/// ```nabi
+/// use optimize::{Bounds, Dual};
+/// use core::array::{Array, Vector};
+///
+/// // Rosenbrock as residuals.
+/// let r = |x: Vector<Dual>| -> Vector<Dual> { Array::from([(x[1] - x[0] * x[0]) * 10.0, 1.0 - x[0]]) };
+/// let s = try optimize::least_squares(r, [-1.2, 1.0]);
+/// assert(s.success() && (s.x[0] - 1.0).abs() < 1e-8);
+/// let b = try optimize::least_squares(r, [-1.2, 1.0], bounds: try Bounds::new([-2.0, -2.0], [0.5, 2.0]));
+/// assert((b.x[0] - 0.5).abs() < 1e-6);
+/// ```
+pub fn least_squares<R: IntoResiduals, X: AsVector<f64>>(r: R, x0: X, bounds: pkg::Bounds? = none, method: LsqMethod? = none, opts: LsqOptions = LsqOptions {}) throws (pkg::OptimizeError) -> LeastSquares {
+    let x0: Vector<f64> = x0.as_vector();
+    let n = x0.len();
+    if n == 0 { throw pkg::OptimizeError::Empty; }
+    try pkg::error::finite(x0, "x0");
+    if !(opts.f_scale > 0.0) { throw pkg::OptimizeError::BadOption { what: f"f_scale = {opts.f_scale}; it must be > 0" }; }
+    let res = r.into_residuals();
+    let b = match bounds { none => pkg::Bounds::free(n), bb: pkg::Bounds => bb };
+    try b.fits(n);
+    let m = match method { none => if b.open() { LsqMethod::Lm } else { LsqMethod::Trf }, mm: LsqMethod => mm };
+    match m {
+        LsqMethod::Lm => {
+            if !b.open() { throw pkg::OptimizeError::BadOption { what: "Levenberg-Marquardt takes no bounds; use `method: LsqMethod::Trf`" }; }
+            try lm::lm(res, x0, opts)
+        }
+        LsqMethod::Trf => try trf::trf(res, x0, b, opts),
+    }
+}

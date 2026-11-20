@@ -1,0 +1,58 @@
+// Global searches on multimodal functions with known global minima;
+// fixed seeds reproduce runs exactly.
+
+use pkg::tests::suite::{close, expect};
+use pkg::{Bounds, Status};
+use core::array::Vector;
+
+#[test]
+fn differential_evolution_finds_global_minima() {
+    let r = try! pkg::differential_evolution(pkg::problems::rastrigin::<f64>, try! Bounds::uniform(3, -5.12, 5.12), seed: 1);
+    expect(r.success() && r.fun < 1e-8, f"rastrigin: {r}");
+    let a = try! pkg::differential_evolution(pkg::problems::ackley::<f64>, try! Bounds::uniform(4, -32.0, 32.0), seed: 2);
+    expect(a.fun < 1e-8, f"ackley: {a}");
+    let h = try! pkg::differential_evolution(pkg::problems::himmelblau::<f64>, try! Bounds::uniform(2, -5.0, 5.0), seed: 3);
+    close(h.fun, 0.0, 1e-12, "himmelblau");
+}
+
+#[test]
+fn seeds_reproduce() {
+    let b = try! Bounds::uniform(2, -5.12, 5.12);
+    let a = try! pkg::differential_evolution(pkg::problems::rastrigin::<f64>, b, seed: 9, polish: false);
+    let c = try! pkg::differential_evolution(pkg::problems::rastrigin::<f64>, b, seed: 9, polish: false);
+    expect(a.x == c.x && a.nfev == c.nfev, "same seed, same run");
+    let s1 = try! pkg::simulated_annealing(pkg::problems::rastrigin::<f64>, b, seed: 4, polish: false);
+    let s2 = try! pkg::simulated_annealing(pkg::problems::rastrigin::<f64>, b, seed: 4, polish: false);
+    expect(s1.x == s2.x, "annealing reproduces");
+}
+
+#[test]
+fn basin_hopping_escapes() {
+    let f = |x: Vector<f64>| -> f64 { (14.5 * x[0] - 0.3).cos() + (x[0] + 0.2) * x[0] };
+    let local = try! pkg::lbfgs(f, [1.0]);
+    let g = try! pkg::basin_hopping(f, [1.0], niter: 200, seed: 3);
+    expect(g.fun < local.fun - 0.1, f"hops below the local minimum {local.fun}: {g}");
+    close(g.x[0], -0.195, 1e-3, "global minimizer");
+    let r = try! pkg::basin_hopping(pkg::problems::rastrigin::<f64>, [3.3, -2.2], niter: 400, seed: 5, niter_success: 150);
+    expect(r.fun < 1e-8, f"rastrigin by hops: {r}");
+    let bnd = try! pkg::basin_hopping(pkg::problems::rastrigin::<f64>, [3.3, -2.2], niter: 300, seed: 5, bounds: try! Bounds::uniform(2, 1.0, 5.0));
+    expect(bnd.x[0] >= 1.0 && bnd.x[1] >= 1.0, "bounded hops stay in the box");
+}
+
+#[test]
+fn simulated_annealing_finds_global_minima() {
+    let b = try! Bounds::uniform(2, -5.0, 5.0);
+    let h = try! pkg::simulated_annealing(pkg::problems::himmelblau::<f64>, b, seed: 11);
+    close(h.fun, 0.0, 1e-10, "himmelblau");
+    let r = try! pkg::simulated_annealing(pkg::problems::rastrigin::<f64>, try! Bounds::uniform(2, -5.12, 5.12), seed: 11);
+    close(r.fun, 0.0, 1e-10, "rastrigin");
+}
+
+#[test]
+fn global_errors_and_stops() {
+    expect((try? pkg::differential_evolution(pkg::problems::sphere::<f64>, Bounds::free(2))) == none, "infinite box refused");
+    expect((try? pkg::differential_evolution(pkg::problems::sphere::<f64>, try! Bounds::uniform(2, -1.0, 1.0), recombination: 2.0)) == none, "recombination out of range");
+    let o = pkg::Options { callback: |s: pkg::Step| -> bool { s.iteration >= 3 } };
+    let r = try! pkg::differential_evolution(pkg::problems::sphere::<f64>, try! Bounds::uniform(2, -1.0, 1.0), opts: o);
+    expect(r.status == Status::Stopped && r.iterations == 3, f"callback stop: {r.message}");
+}

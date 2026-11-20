@@ -1,0 +1,166 @@
+// Dual numbers against hand derivatives, AD against finite differences
+// and the complex step, and the derivative checks.
+
+use pkg::tests::suite::{close, expect, rel};
+use pkg::{Diff, Dual, Objective, Smooth};
+use core::array::{Array, Matrix, Vector};
+use core::num::Complex;
+
+fn f<T: Smooth>(x: Vector<T>) -> T {
+    // A mix of every elementary function of `Smooth`; `T` is known only
+    // through its bound, so `x.sqrt()` and `x.abs()` are `Smooth`'s
+    // methods for T = Complex<f64> too.
+    (x[0] * x[1]).sin() + x[0].exp() / (x[1] * x[1] + 1.0) + (x[2] * x[2] + 1.0).ln() * x[1].cos() + x[2].tanh() * x[0].atan() + x[1].sqrt() + x[2].powi(3) - x[0].powf(2.5) + x[1].sinh() * 0.1 + x[2].cosh() * 0.01 + x[0].tan() * 0.5 + x[2].abs()
+}
+
+/// The gradient of `f`, by hand.
+fn df(x: Vector<f64>) -> Vector<f64> {
+    let (a, b, c) = (x[0], x[1], x[2]);
+    let q = b * b + 1.0;
+    let g0 = b * (a * b).cos() + a.exp() / q + c.tanh() / (1.0 + a * a) - 2.5 * a.powf(1.5) + 0.5 / (a.cos() * a.cos());
+    let g1 = a * (a * b).cos() - a.exp() * 2.0 * b / (q * q) - (c * c + 1.0).ln() * b.sin() + 0.5 / b.sqrt() + 0.1 * b.cosh();
+    let th = c.tanh();
+    let g2 = 2.0 * c / (c * c + 1.0) * b.cos() + (1.0 - th * th) * a.atan() + 3.0 * c * c + 0.01 * c.sinh() + c.signum();
+    Array::from([g0, g1, g2])
+}
+
+#[test]
+fn dual_arithmetic() {
+    let x = Dual::var(2.0);
+    let y = Dual::new(3.0, 0.5);
+    expect(x + y == Dual::new(5.0, 1.5), "add");
+    expect(x - y == Dual::new(-1.0, 0.5), "sub");
+    expect(x * y == Dual::new(6.0, 4.0), "mul: 2 * 0.5 + 1 * 3");
+    let q = x / y;
+    close(q.du, (1.0 * 3.0 - 2.0 * 0.5) / 9.0, 1e-16, "div");
+    expect(-x == Dual::new(-2.0, -1.0), "neg");
+    expect(2.0 + x == Dual::new(4.0, 1.0) && x + 2.0 == Dual::new(4.0, 1.0), "scalar add");
+    expect(2.0 - x == Dual::new(0.0, -1.0) && x - 2.0 == Dual::new(0.0, 1.0), "scalar sub");
+    expect(3.0 * x == Dual::new(6.0, 3.0) && x * 3.0 == Dual::new(6.0, 3.0), "scalar mul");
+    close((1.0 / x).du, -0.25, 1e-16, "scalar div");
+    expect(x ** 3 == Dual::new(8.0, 12.0), "x ** 3");
+    close((x ** 0.5).du, 0.5 / 2.0f64.sqrt(), 1e-16, "x ** 0.5");
+    close((2.0 ** x).du, 4.0 * 2.0f64.ln(), 1e-15, "2 ** x");
+    close((x ** x).du, 4.0 * (2.0f64.ln() + 1.0), 1e-14, "x ** x");
+    expect(√Dual::var(9.0) == Dual::new(3.0, 1.0 / 6.0), "prefix sqrt");
+    let z = x;
+    z += y;
+    z *= Dual::constant(2.0);
+    expect(z == Dual::new(10.0, 3.0), "compound assignment");
+    expect(x < y && y > x && x <= x, "ordering by value");
+    expect(f"{Dual::new(1.0, -2.0)}" == "1-2ε" && f"{x}" == "2+1ε", "display");
+}
+
+#[test]
+fn ad_matches_hand_gradient() {
+    let x: Vector<f64> = [0.7, 1.3, -0.4];
+    let g = pkg::grad(f::<Dual>, x);
+    let h = df(x);
+    for i in 0..3 { close(g[i], h[i], 1e-14 * h[i].abs().max(1.0), f"AD [{i}]"); }
+    let (v, _) = pkg::value_grad(f::<Dual>, x);
+    close(v, f::<f64>(x), 1e-15, "AD value");
+    let cs = pkg::complex_step_grad(f::<Complex<f64>>, x);
+    for i in 0..3 { close(cs[i], h[i], 1e-14 * h[i].abs().max(1.0), f"complex step [{i}]"); }
+    let ce = pkg::approx_grad(f::<f64>, x, Diff::Central);
+    let fw = pkg::approx_grad(f::<f64>, x, Diff::Forward);
+    for i in 0..3 {
+        close(ce[i], h[i], 1e-8, f"central [{i}]");
+        close(fw[i], h[i], 1e-6, f"forward [{i}]");
+    }
+}
+
+#[test]
+fn check_grad_detects_errors() {
+    let x: Vector<f64> = [0.7, 1.3, -0.4];
+    expect(pkg::check_grad(f::<f64>, df, x) < 1e-8, "the hand gradient checks");
+    let wrong = |y: Vector<f64>| -> Vector<f64> {
+        let g = df(y);
+        g[1] += 1e-3;
+        g
+    };
+    expect(pkg::check_grad(f::<f64>, wrong, x) > 1e-4, "a wrong gradient is caught");
+}
+
+#[test]
+fn jacobians_and_hessians() {
+    let r = |x: Vector<Dual>| -> Vector<Dual> { Array::from([x[0] * x[1], x[0].sin() + x[1] * x[1], x[0].exp()]) };
+    let rf = |x: Vector<f64>| -> Vector<f64> { Array::from([x[0] * x[1], x[0].sin() + x[1] * x[1], x[0].exp()]) };
+    let x: Vector<f64> = [0.5, 2.0];
+    let ja = pkg::jacobian(r, x);
+    let jf = pkg::approx_jacobian(rf, x, Diff::Central);
+    let want: Matrix<f64> = [[2.0, 0.5], [0.5f64.cos(), 4.0], [0.5f64.exp(), 0.0]];
+    expect(ja.shape() == [3, 2], "jacobian shape");
+    for i in 0..3 {
+        for k in 0..2 {
+            close(ja[i, k], want[i, k], 1e-15, f"AD jacobian [{i}, {k}]");
+            close(jf[i, k], want[i, k], 1e-8, f"FD jacobian [{i}, {k}]");
+        }
+    }
+    // Hessian of x0^2 x1 + sin(x0 x1).
+    let g = |x: Vector<f64>| -> f64 { x[0] * x[0] * x[1] + (x[0] * x[1]).sin() };
+    let gd = |x: Vector<Dual>| -> Dual { x[0] * x[0] * x[1] + (x[0] * x[1]).sin() };
+    let (a, b) = (x[0], x[1]);
+    let s = (a * b).sin();
+    let c = (a * b).cos();
+    let hw: Matrix<f64> = [[2.0 * b - b * b * s, 2.0 * a + c - a * b * s], [2.0 * a + c - a * b * s, -a * a * s]];
+    let h1 = pkg::approx_hessian(g, x);
+    let h2 = Objective::dual(gd).hessian(x);
+    for i in 0..2 {
+        for k in 0..2 {
+            close(h1[i, k], hw[i, k], 1e-5, f"FD hessian [{i}, {k}]");
+            close(h2[i, k], hw[i, k], 1e-7, f"AD-gradient hessian [{i}, {k}]");
+            close(h1[i, k], h1[k, i], 0.0, "symmetric");
+        }
+    }
+}
+
+#[test]
+fn scalar_derivatives() {
+    close(pkg::derivative(|x: Dual| -> Dual { x.ln() * x }, 2.0), 2.0f64.ln() + 1.0, 1e-15, "d/dx x ln x");
+    close(pkg::derivative(|x: Dual| -> Dual { x.asin() + x.acos() }, 0.3), 0.0, 1e-15, "asin + acos is constant");
+    close(pkg::derivative(|x: Dual| -> Dual { x.atan2(Dual::constant(1.0)) }, 1.0), 0.5, 1e-15, "atan2");
+    close(pkg::derivative(|x: Dual| -> Dual { x.hypot(Dual::constant(4.0)) }, 3.0), 0.6, 1e-15, "hypot");
+    close(pkg::derivative(|x: Dual| -> Dual { x.exp_m1() + x.ln_1p() }, 0.0), 2.0, 1e-15, "exp_m1 + ln_1p");
+    close(pkg::derivative(|x: Dual| -> Dual { x.max(Dual::constant(1.0)) }, 2.0), 1.0, 0.0, "max");
+    close(pkg::derivative(|x: Dual| -> Dual { x.abs() }, 0.0), 0.0, 0.0, "abs at 0");
+    expect(!Dual::new(f64::NAN, 0.0).is_finite() && Dual::var(1.0).is_finite(), "is_finite");
+}
+
+#[test]
+fn complex_step_is_exact_at_tiny_scales() {
+    // Forward differences lose all digits here; the complex step keeps them.
+    let x: Vector<f64> = [1e-9];
+    let g = pkg::complex_step_grad(|z: Vector<Complex<f64>>| -> Complex<f64> { Smooth::exp(z[0] * 1e9) }, x);
+    rel(g[0], 1e9 * 1.0f64.exp(), 1e-15, "d/dx e^(1e9 x)");
+}
+
+#[test]
+fn objectives_count_and_agree() {
+    let o = Objective::new(f::<f64>).with_diff(Diff::Forward);
+    let x: Vector<f64> = [0.7, 1.3, -0.4];
+    let a = o.gradient(x);
+    let b = Objective::complex(f::<Complex<f64>>).gradient(x);
+    let c = Objective::new(f::<f64>).with_grad(df).gradient(x);
+    for i in 0..3 {
+        close(a[i], c[i], 1e-6, "forward objective");
+        close(b[i], c[i], 1e-13, "complex objective");
+    }
+    let m = try! pkg::bfgs(Objective::new(pkg::problems::rosen::<f64>).with_value_grad(|y: Vector<f64>| -> (f64, Vector<f64>) { (pkg::problems::rosen(y), pkg::problems::rosen_grad(y)) }), [-1.2, 1.0]);
+    expect(m.success() && m.ngev == m.nfev, f"value-and-gradient objective: {m}");
+    let fd = try! pkg::bfgs(pkg::problems::rosen::<f64>, [-1.2, 1.0]);
+    expect(fd.success() && fd.ngev == 0 && fd.nfev > 4 * fd.iterations, "difference gradients count as f evaluations");
+}
+
+#[test]
+fn reverse_mode_objectives() {
+    let x0: Vector<f64> = [-1.2, 1.0, -1.2, 1.0];
+    let o = Objective::reverse(pkg::problems::rosen::<pkg::Var>);
+    let w = pkg::problems::rosen_grad(x0);
+    expect(o.gradient(x0).all_close(w, rel: 1e-13), "reverse gradient");
+    expect(o.value(x0) == pkg::problems::rosen::<f64>(x0), "reverse value");
+    let m = try! pkg::lbfgs(pkg::problems::rosen::<pkg::Var>, x0);
+    expect(m.success() && m.x.all_close(Vector::<f64>::from([1.0, 1.0, 1.0, 1.0]), rel: 1e-5), f"lbfgs over Var: {m}");
+    // Starts as lists or integer literals.
+    let s = try! pkg::bfgs(|x: Vector<pkg::Var>| -> pkg::Var { (x[0] - 3.0) ** 2 + x[1] * x[1] }, [0, 0]);
+    expect(s.x.all_close(Vector::<f64>::from([3.0, 0.0]), abs: 1e-6), f"bfgs from [0, 0]: {s}");
+}

@@ -1,0 +1,108 @@
+// Levenberg-Marquardt with More's (1978) column scaling D (the largest
+// column norms of J seen so far) and Nielsen's (1999) damping update.
+// Each step solves the damped problem [J; sqrt(mu) D] h = [-r; 0] by
+// pivoted QR (linalg::lstsq), never forming J^T J, so the conditioning
+// is that of J, not its square.
+
+use pkg::error::OptimizeError;
+use pkg::lsq::loss::{cost, scale};
+use pkg::lsq::{LeastSquares, LsqOptions, Residuals};
+use pkg::objective::{dot, inf_norm, norm};
+use pkg::result::Status;
+use core::array::{Array, Matrix, Vector};
+
+/// `r` and `J` at `x`, scaled for the loss, and the cost.
+pub(pkg) fn state(res: Residuals, x: Vector<f64>, r0: Vector<f64>, opts: LsqOptions) -> (Vector<f64>, Matrix<f64>, f64) {
+    let (rs, j, c, _) = state_cols(res, x, r0, opts);
+    (rs, j, c)
+}
+
+/// `state` and the squared column norms of the unscaled Jacobian.
+fn state_cols(res: Residuals, x: Vector<f64>, r0: Vector<f64>, opts: LsqOptions) -> (Vector<f64>, Matrix<f64>, f64, Vector<f64>) {
+    let j = res.jacobian_at(x, r0).copy();
+    let (m, n) = (j.shape()[0], j.shape()[1]);
+    let cols: Vector<f64> = Array::zeros([n]);
+    for i in 0..m {
+        for k in 0..n { cols[k] += j[i, k] * j[i, k]; }
+    }
+    let rs = r0.copy();
+    let c = cost(opts.loss, opts.f_scale, r0);
+    scale(opts.loss, opts.f_scale, rs, j);
+    (rs, j, c, cols)
+}
+
+/// `J^T v`.
+pub(pkg) fn jtv(j: Matrix<f64>, v: Vector<f64>) -> Vector<f64> { v @ j }
+
+pub(pkg) fn lm(res: Residuals, x0: Vector<f64>, opts: LsqOptions) throws (OptimizeError) -> LeastSquares {
+    let n = x0.len();
+    let x = x0.copy();
+    let r = res.value(x);
+    let m = r.len();
+    if m == 0 { throw OptimizeError::ShapeMismatch { what: "the residual function returned no residuals" }; }
+    try pkg::error::finite(r, "the residuals at x0");
+    let jc = res.jac_cost(n);
+    let max_nfev = if opts.max_nfev > 0 { opts.max_nfev } else if jc > 0 { 200 * n } else { 100 * n };
+    let nfev = 1;
+    let njev = 1;
+    // The scaling D comes from the unscaled Jacobian: a robust loss
+    // flattens the rows of large residuals, which must not unbound the
+    // step.
+    let (rs, j, c, dd) = state_cols(res, x, r, opts);
+    nfev += jc;
+    let top = 0.0;
+    for k in 0..n {
+        if !(dd[k] > 0.0) { dd[k] = 1.0; }
+        top = top.max(dd[k]);
+    }
+    let mu = 1e-3 * top;
+    let nu = 2.0;
+    let g = jtv(j, rs);
+    let it = 0;
+    let status = Status::MaxEvaluations;
+    let why = "max_nfev";
+    let a: Matrix<f64> = Array::zeros([m + n, n]);
+    let rhs: Vector<f64> = Array::zeros([m + n]);
+    while nfev < max_nfev {
+        if inf_norm(g) <= opts.gtol { status = Status::Converged; why = "gtol"; break; }
+        a[0:m] .= j;
+        a[m:] .= 0.0;
+        let sm = mu.sqrt();
+        for k in 0..n { a[m + k, k] = sm * dd[k].sqrt(); }
+        rhs[0:m] .= rs .* -1.0;
+        rhs[m:] .= 0.0;
+        let h = try linalg::lstsq(a, rhs) catch e: linalg::LinalgError { throw OptimizeError::from(e); };
+        it += 1;
+        let xn = x .+ h;
+        let rn = res.value(xn);
+        nfev += 1;
+        let cn = if rn.len() == m { cost(opts.loss, opts.f_scale, rn) } else { f64::INFINITY };
+        // The model's decrease: c - |rs + J h|^2 / 2.
+        let jh = j @ h;
+        let pred = -dot(rs, jh) - 0.5 * dot(jh, jh);
+        let rho = if pred > 0.0 && cn.is_finite() { (c - cn) / pred } else { -1.0 };
+        if rho > 0.0 {
+            let df = c - cn;
+            x = xn;
+            let (rs2, j2, c2, d2) = state_cols(res, x, rn, opts);
+            rs = rs2;
+            j = j2;
+            c = c2;
+            nfev += jc;
+            njev += 1;
+            g = jtv(j, rs);
+            for k in 0..n { dd[k] = dd[k].max(d2[k]); }
+            mu *= (1.0 / 3.0f64).max(1.0 - (2.0 * rho - 1.0) ** 3);
+            nu = 2.0;
+            if df <= opts.ftol * (c + df) && rho > 0.25 { status = Status::Converged; why = "ftol"; break; }
+            if norm(h) <= opts.xtol * (opts.xtol + norm(x)) { status = Status::Converged; why = "xtol"; break; }
+            if c == 0.0 { status = Status::Converged; why = "zero residual"; break; }
+        } else {
+            mu *= nu;
+            nu *= 2.0;
+            if !(mu < 1e300) { status = Status::Stalled; why = "damping overflow"; break; }
+        }
+    }
+    let r_final = res.value(x);
+    LeastSquares { x, cost: c, fun: r_final, jac: j, optimality: inf_norm(g), status, iterations: it, nfev: nfev + 1, njev, message: f"Levenberg-Marquardt: {status} ({why})" }
+}

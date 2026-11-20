@@ -1,0 +1,121 @@
+// Nelder-Mead downhill simplex (Nelder and Mead 1965; the adaptive
+// coefficients of Gao and Han 2012 for larger n). Needs only values of
+// f, tolerates noise and kinks, converges slowly; best below about 10
+// variables.
+
+use pkg::IntoObjective;
+use pkg::error::OptimizeError;
+use pkg::minimize::{done, report, start};
+use pkg::objective::{Eval, inf_norm};
+use pkg::result::{Minimum, Options, Status};
+use core::array::{Array, Vector};
+use linalg::AsVector;
+
+/// The Nelder-Mead simplex method. The start simplex is `x0` and `n`
+/// points that each scale one coordinate by `1 + step` (5% by default;
+/// a zero coordinate moves to 0.00025); `adaptive` scales the expansion, contraction
+/// and shrink coefficients with `n` (Gao and Han), which helps beyond a
+/// few variables. Stops when the values at the vertices agree to
+/// `ftol * max(1, |f|)` and the simplex is smaller than
+/// `sqrt(xtol) (1 + |x|)` (f is flat to O(dx^2) near a minimum, so a
+/// tighter simplex only measures rounding).
+///
+/// ```nabi
+/// let m = try optimize::nelder_mead(optimize::problems::rosen::<f64>, [-1.2, 1.0]);
+/// assert(m.success() && (m.x[0] - 1.0).abs() < 1e-5);
+/// ```
+pub fn nelder_mead<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, step: f64 = 0.05, adaptive: bool = true, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    if !(step > 0.0) { throw OptimizeError::BadOption { what: f"step = {step}; it must be > 0" }; }
+    let (ev, x, fx, _) = try start(f.into_objective(), x0, false);
+    let n = x.len();
+    let nf = n as f64;
+    let (alpha, gamma, rho, sigma) = if adaptive && n > 1 { (1.0, 1.0 + 2.0 / nf, 0.75 - 0.5 / nf, 1.0 - 1.0 / nf) } else { (1.0, 2.0, 0.5, 0.5) };
+    let pts: List<Vector<f64>> = [x];
+    let vals: List<f64> = [fx];
+    for i in 0..n {
+        let y = x.copy();
+        y[i] = if y[i] != 0.0 { (1.0 + step) * y[i] } else { 0.00025 };
+        pts.push(y);
+        vals.push(ev.f(y));
+    }
+    let iters = opts.iters(n, 1000);
+    let xtol = opts.xtol.sqrt();
+    let k = 0;
+    let status = Status::MaxIterations;
+    while k < iters {
+        order(pts, vals);
+        if converged(pts, vals, opts.ftol, xtol) { status = Status::Converged; break; }
+        if !vals[0].is_finite() { status = Status::NotFinite; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+        k += 1;
+        let c: Vector<f64> = Array::zeros([n]);
+        for i in 0..n { c .+= pts[i]; }
+        c ./= nf;
+        let worst = pts[n];
+        let xr = c .+ alpha .* (c .- worst);
+        let fr = ev.f(xr);
+        if fr < vals[0] {
+            let xe = c .+ gamma .* (xr .- c);
+            let fe = ev.f(xe);
+            if fe < fr { put(pts, vals, n, xe, fe); } else { put(pts, vals, n, xr, fr); }
+        } else if fr < vals[n - 1] {
+            put(pts, vals, n, xr, fr);
+        } else {
+            let outside = fr < vals[n];
+            let xc = if outside { c .+ rho .* (xr .- c) } else { c .+ rho .* (worst .- c) };
+            let fc = ev.f(xc);
+            if (outside && fc <= fr) || (!outside && fc < vals[n]) {
+                put(pts, vals, n, xc, fc);
+            } else {
+                shrink(ref ev, pts, vals, sigma);
+            }
+        }
+        if report(opts, k, pts[0], vals[0], Vector::<f64>::from(List::new())) { status = Status::Stopped; break; }
+    }
+    order(pts, vals);
+    done(ev, pts[0], vals[0], Vector::<f64>::from(List::new()), status, k, "Nelder-Mead")
+}
+
+fn put(pts: List<Vector<f64>>, vals: List<f64>, i: usize, x: Vector<f64>, v: f64) {
+    pts[i] = x;
+    vals[i] = v;
+}
+
+fn shrink(ref ev: Eval, pts: List<Vector<f64>>, vals: List<f64>, sigma: f64) {
+    let best = pts[0];
+    for i in 1..pts.len() {
+        let y = best .+ sigma .* (pts[i] .- best);
+        pts[i] = y;
+        vals[i] = ev.f(y);
+    }
+}
+
+/// Sorts the vertices by value (NaN last), stable.
+fn order(pts: List<Vector<f64>>, vals: List<f64>) {
+    let m = vals.len();
+    for i in 1..m {
+        let j = i;
+        while j > 0 && worse(vals[j - 1], vals[j]) {
+            let t = vals[j];
+            vals[j] = vals[j - 1];
+            vals[j - 1] = t;
+            let p = pts[j];
+            pts[j] = pts[j - 1];
+            pts[j - 1] = p;
+            j -= 1;
+        }
+    }
+}
+
+fn worse(a: f64, b: f64) -> bool { a > b || (a != a && b == b) }
+
+fn converged(pts: List<Vector<f64>>, vals: List<f64>, ftol: f64, xtol: f64) -> bool {
+    let f0 = vals[0];
+    let scale = inf_norm(pts[0]);
+    for i in 1..vals.len() {
+        if !((vals[i] - f0).abs() <= ftol * f0.abs().max(1.0)) { return false; }
+        if inf_norm(pts[i] .- pts[0]) > xtol * (1.0 + scale) { return false; }
+    }
+    true
+}

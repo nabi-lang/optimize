@@ -1,0 +1,161 @@
+// Nonlinear least squares on NIST StRD nonlinear regression datasets
+// against their certified values (parameters, standard errors, residual
+// sum of squares), from NIST's second start, by Levenberg-Marquardt and
+// trust-region reflective, with AD and difference Jacobians; bounds,
+// robust losses, weights and covariances.
+
+use pkg::tests::suite::{close, expect, rel};
+use pkg::{Bounds, Dual, Loss, LsqMethod, LsqOptions, Model, Residuals};
+use core::array::{Array, Vector};
+
+struct Nist {
+    name: str;
+    model: fn(f64, Vector<Dual>) -> Dual;
+    x: Vector<f64>;
+    y: Vector<f64>;
+    start: Vector<f64>;
+    b: Vector<f64>;
+    se: Vector<f64>;
+    rss: f64;
+}
+
+fn misra_x() -> Vector<f64> { [77.6, 114.9, 141.1, 190.8, 239.9, 289.0, 332.8, 378.4, 434.8, 477.3, 536.8, 593.1, 689.1, 760.0] }
+
+fn misra_y() -> Vector<f64> { [10.07, 14.73, 17.94, 23.93, 29.61, 35.18, 40.02, 44.82, 50.76, 55.05, 61.01, 66.40, 75.47, 81.78] }
+
+fn sets() -> List<Nist> {
+    [
+        Nist {
+            name: "Misra1a", model: |x: f64, b: Vector<Dual>| -> Dual { b[0] * (1.0 - (b[1] * -x).exp()) },
+            x: misra_x(), y: misra_y(), start: [250.0, 5e-4],
+            b: [2.3894212918e+02, 5.5015643181e-04], se: [2.7070075241e+00, 7.2668688436e-06], rss: 1.2455138894e-01,
+        },
+        Nist {
+            name: "Misra1b", model: |x: f64, b: Vector<Dual>| -> Dual { b[0] * (1.0 - (1.0 + b[1] * x / 2.0) ** -2) },
+            x: misra_x(), y: misra_y(), start: [300.0, 2e-4],
+            b: [3.3799746163e+02, 3.9039091287e-04], se: [3.1643950207e+00, 4.2547321834e-06], rss: 7.5464681533e-02,
+        },
+        Nist {
+            name: "Misra1c", model: |x: f64, b: Vector<Dual>| -> Dual { b[0] * (1.0 - (1.0 + 2.0 * b[1] * x) ** -0.5) },
+            x: misra_x(), y: misra_y(), start: [600.0, 2e-4],
+            b: [6.3642725809e+02, 2.0813627256e-04], se: [4.6638326572e+00, 1.7728423155e-06], rss: 4.0966836971e-02,
+        },
+        Nist {
+            name: "Misra1d", model: |x: f64, b: Vector<Dual>| -> Dual { b[0] * b[1] * x / (1.0 + b[1] * x) },
+            x: misra_x(), y: misra_y(), start: [450.0, 3e-4],
+            b: [4.3736970754e+02, 3.0227324449e-04], se: [3.6489174345e+00, 2.9334354479e-06], rss: 5.6419295283e-02,
+        },
+        Nist {
+            name: "DanWood", model: |x: f64, b: Vector<Dual>| -> Dual { b[0] * Dual::constant(x).pow(b[1]) },
+            x: [1.309, 1.471, 1.490, 1.565, 1.611, 1.680], y: [2.138, 3.421, 3.597, 4.340, 4.882, 5.660], start: [0.7, 4.0],
+            b: [7.6886226176e-01, 3.8604055871e+00], se: [1.8281973860e-02, 5.1726610913e-02], rss: 4.3173084083e-03,
+        },
+        Nist {
+            name: "BoxBOD", model: |x: f64, b: Vector<Dual>| -> Dual { b[0] * (1.0 - (b[1] * -x).exp()) },
+            x: [1.0, 2.0, 3.0, 5.0, 7.0, 10.0], y: [109.0, 149.0, 149.0, 191.0, 213.0, 224.0], start: [100.0, 0.75],
+            b: [2.1380940889e+02, 5.4723748542e-01], se: [1.2354515176e+01, 1.0455993237e-01], rss: 1.1680088766e+03,
+        },
+        Nist {
+            name: "MGH09", model: |x: f64, b: Vector<Dual>| -> Dual { b[0] * (x * x + b[1] * x) / (b[2] * x + b[3] + x * x) },
+            x: [4.0, 2.0, 1.0, 0.5, 0.25, 0.167, 0.125, 0.1, 0.0833, 0.0714, 0.0625],
+            y: [0.1957, 0.1947, 0.1735, 0.16, 0.0844, 0.0627, 0.0456, 0.0342, 0.0323, 0.0235, 0.0246], start: [0.25, 0.39, 0.415, 0.39],
+            b: [1.9280693458e-01, 1.9128232873e-01, 1.2305650693e-01, 1.3606233068e-01], se: [1.1435312227e-02, 1.9633220911e-01, 8.0842031232e-02, 9.0025542308e-02], rss: 3.0750560385e-04,
+        },
+        Nist {
+            name: "MGH10", model: |x: f64, b: Vector<Dual>| -> Dual { b[0] * (b[1] / (b[2] + x)).exp() },
+            x: [50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0, 105.0, 110.0, 115.0, 120.0, 125.0],
+            y: [34780.0, 28610.0, 23650.0, 19630.0, 16370.0, 13720.0, 11540.0, 9744.0, 8261.0, 7030.0, 6005.0, 5147.0, 4427.0, 3820.0, 3307.0, 2872.0], start: [0.02, 4000.0, 250.0],
+            b: [5.6096364710e-03, 6.1813463463e+03, 3.4522363462e+02], se: [1.5687892471e-04, 2.3309021107e+01, 7.8486103508e-01], rss: 8.7945855171e+01,
+        },
+    ]
+}
+
+#[test]
+fn nist_certified_values() {
+    let tight = LsqOptions { ftol: 1e-15, xtol: 1e-15, gtol: 1e-15, max_nfev: 5000 };
+    for s in sets() {
+        for method in [LsqMethod::Lm, LsqMethod::Trf] {
+            let fit = try! pkg::curve_fit(s.model, s.x, s.y, s.start, opts: tight);
+            let r = if method == LsqMethod::Lm { fit } else {
+                let res = s.model.residuals(s.x, s.y, Array::full([s.x.len()], 1.0));
+                let ls = try! pkg::least_squares(res, s.start, method: LsqMethod::Trf, opts: tight);
+                let f2 = fit;
+                f2.params = ls.x;
+                f2.rss = 2.0 * ls.cost;
+                f2
+            };
+            for i in 0..s.b.len() { rel(r.params[i], s.b[i], 1e-7, f"{s.name} {method:?} b{i + 1}"); }
+            rel(r.rss, s.rss, 1e-8, f"{s.name} {method:?} residual sum of squares");
+            if method == LsqMethod::Lm {
+                for i in 0..s.se.len() { rel(fit.stderr[i], s.se[i], 1e-5, f"{s.name} se{i + 1}"); }
+                expect(fit.dof == s.x.len() - s.b.len(), "degrees of freedom");
+            }
+        }
+    }
+}
+
+#[test]
+fn difference_jacobian_reaches_the_same() {
+    let model = |x: f64, b: Vector<f64>| -> f64 { b[0] * (1.0 - (-b[1] * x).exp()) };
+    let fit = try! pkg::curve_fit(model, misra_x(), misra_y(), [250.0, 5e-4]);
+    rel(fit.params[0], 2.3894212918e+02, 1e-6, "b1 with forward differences");
+    rel(fit.stderr[0], 2.7070075241e+00, 1e-3, "se1 with forward differences");
+}
+
+#[test]
+fn linear_fit_covariance_closed_form() {
+    // y = p0 + p1 t: the covariance is s^2 (X^T X)^-1.
+    let t: Vector<f64> = [0.0, 1.0, 2.0, 3.0, 4.0];
+    let y: Vector<f64> = [1.1, 2.9, 5.2, 7.1, 8.8];
+    let fit = try! pkg::curve_fit(|x: f64, p: Vector<f64>| -> f64 { p[0] + p[1] * x }, t, y, [0.0, 0.0]);
+    let (sx, sxx, n) = (10.0, 30.0, 5.0);
+    let det = n * sxx - sx * sx;
+    let s2 = fit.rss / 3.0;
+    close(fit.cov[0, 0], s2 * sxx / det, 1e-9, "var p0");
+    close(fit.cov[1, 1], s2 * n / det, 1e-9, "var p1");
+    close(fit.cov[0, 1], -s2 * sx / det, 1e-9, "cov p0 p1");
+    close(fit.params[1], 1.96, 1e-8, "slope");
+    let w = try! pkg::curve_fit(|x: f64, p: Vector<f64>| -> f64 { p[0] + p[1] * x }, t, y, [0.0, 0.0], sigma: Array::full([5], 0.1), absolute_sigma: true);
+    rel(w.cov[1, 1], 0.01 * n / det, 1e-6, "absolute sigma covariance");
+    close(w.params[1], 1.96, 1e-8, "uniform weights keep the fit");
+}
+
+#[test]
+fn bounds_with_trf() {
+    // Misra1a with b1 capped below its optimum: b1 lands on the bound.
+    let b = try! Bounds::new([0.0, 0.0], [200.0, 1.0]);
+    let model = |x: f64, p: Vector<Dual>| -> Dual { p[0] * (1.0 - (p[1] * -x).exp()) };
+    let fit = try! pkg::curve_fit(model, misra_x(), misra_y(), [100.0, 1e-3], bounds: b);
+    expect(fit.params[0] <= 200.0 && fit.params[0] > 199.999, f"b1 at its bound: {fit.params:?}");
+    expect(fit.params ∈ b, "in the box");
+}
+
+#[test]
+fn robust_losses_ignore_outliers() {
+    let n = 30;
+    let t: Vector<f64> = Array::from_fn([n], |i: [usize; 1]| -> f64 { (i[0] as f64) / 3.0 });
+    let y = t .* 2.0 .+ 1.0;
+    for k in [4, 11, 23] { y[k] += 40.0; }
+    let line = |x: f64, p: Vector<f64>| -> f64 { p[0] + p[1] * x };
+    let plain = try! pkg::curve_fit(line, t, y, [0.0, 0.0]);
+    expect((plain.params[0] - 1.0).abs() > 1.0, "least squares is pulled away");
+    for loss in [Loss::SoftL1, Loss::Huber, Loss::Cauchy, Loss::Arctan] {
+        let r = try! pkg::curve_fit(line, t, y, [0.0, 0.0], opts: LsqOptions { loss, f_scale: 0.5 });
+        close(r.params[0], 1.0, 0.1, f"{loss:?} intercept");
+        close(r.params[1], 2.0, 0.02, f"{loss:?} slope");
+    }
+}
+
+#[test]
+fn least_squares_edge_cases() {
+    let r = |x: Vector<f64>| -> Vector<f64> { Array::from([x[0] - 1.0, x[1] + 2.0, x[0] * x[1] + 2.0]) };
+    let s = try! pkg::least_squares(r, [0.0, 0.0]);
+    expect(s.success() && s.cost < 1e-20, f"zero residual: {s}");
+    expect((try? pkg::least_squares(r, List::<f64>::new())) == none, "empty x0");
+    expect((try? pkg::least_squares(r, [f64::NAN, 0.0])) == none, "NaN x0");
+    expect((try? pkg::least_squares(r, [0.0, 0.0], bounds: try! Bounds::uniform(2, -5.0, 5.0), method: LsqMethod::Lm)) == none, "LM refuses bounds");
+    let few = try! pkg::least_squares(Residuals::dual(|x: Vector<Dual>| -> Vector<Dual> { Array::from([x[0] * x[1] - 1.0]) }), [3.0, 3.0]);
+    expect(few.cost < 1e-20, "fewer residuals than unknowns");
+    expect((try? pkg::curve_fit(|x: f64, p: Vector<f64>| -> f64 { p[0] * x }, [1.0, 2.0], [1.0], [1.0])) == none, "x and y lengths differ");
+    expect((try? pkg::curve_fit(|x: f64, p: Vector<f64>| -> f64 { p[0] * x }, [1.0, 2.0], [1.0, 2.0], [1.0], sigma: [1.0, 0.0])) == none, "zero sigma");
+}

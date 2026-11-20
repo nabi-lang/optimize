@@ -1,0 +1,81 @@
+// Nonlinear constraints: Hock and Schittkowski (1981) problems with
+// their published optima, constraint satisfaction, multipliers through
+// the KKT conditions, the operator forms.
+
+use pkg::tests::suite::{close, expect};
+use pkg::{Bounds, Constraint, Dual, Status};
+use core::array::{Array, Vector};
+
+#[test]
+fn hs71() {
+    let f = |x: Vector<Dual>| -> Dual { x[0] * x[3] * (x[0] + x[1] + x[2]) + x[2] };
+    let prod = Constraint::ge(|x: Vector<Dual>| -> Dual { x[0] * x[1] * x[2] * x[3] }, 25.0);
+    let sq = Constraint::eq(|x: Vector<Dual>| -> Dual { x[0] * x[0] + x[1] * x[1] + x[2] * x[2] + x[3] * x[3] }, 40.0);
+    let b = try! Bounds::uniform(4, 1.0, 5.0);
+    let r = try! pkg::auglag(f, [1.0, 5.0, 5.0, 1.0], [prod, sq], bounds: b);
+    expect(r.success(), f"{r}");
+    close(r.fun, 17.0140173, 1e-6, "f*");
+    let want = [1.0, 4.7429994, 3.8211503, 1.3794082];
+    for i in 0..4 { close(r.x[i], want[i], 1e-5, f"x[{i}]"); }
+    expect(prod.holds(r.x) && sq.holds(r.x), "feasible");
+    close(r.multipliers[0], 0.55229366, 1e-5, "multiplier of the product");
+    close(r.multipliers[1].abs(), 0.16146857, 1e-5, "multiplier of the sphere");
+}
+
+#[test]
+fn hs6_equality() {
+    // min (1 - x1)^2 s.t. 10 (x2 - x1^2) = 0; f* = 0 at (1, 1).
+    let f = |x: Vector<Dual>| -> Dual { (1.0 - x[0]) * (1.0 - x[0]) };
+    let c = Constraint::eq(|x: Vector<Dual>| -> Dual { (x[1] - x[0] * x[0]) * 10.0 }, 0.0);
+    let r = try! pkg::auglag(f, [-1.2, 1.0], [c]);
+    expect(r.success() && r.violation <= 1e-8, f"{r}");
+    close(r.x[0], 1.0, 1e-4, "x1");
+    close(r.fun, 0.0, 1e-8, "f*");
+}
+
+#[test]
+fn hs35_inequality() {
+    // HS35: f* = 1/9 at (4/3, 7/9, 4/9).
+    let f = |x: Vector<Dual>| -> Dual { 9.0 - 8.0 * x[0] - 6.0 * x[1] - 4.0 * x[2] + 2.0 * x[0] * x[0] + 2.0 * x[1] * x[1] + x[2] * x[2] + 2.0 * x[0] * x[1] + 2.0 * x[0] * x[2] };
+    let c = Constraint::le(|x: Vector<Dual>| -> Dual { x[0] + x[1] + 2.0 * x[2] }, 3.0);
+    let r = try! pkg::auglag(f, [0.5, 0.5, 0.5], [c], bounds: try! Bounds::uniform(3, 0.0, f64::INFINITY));
+    expect(r.success(), f"{r}");
+    close(r.fun, 1.0 / 9.0, 1e-7, "f*");
+    close(r.x[0], 4.0 / 3.0, 1e-4, "x1");
+    close(r.x[2], 4.0 / 9.0, 1e-4, "x3");
+}
+
+#[test]
+fn kkt_conditions_hold() {
+    // At the solution grad f + sum l grad h = 0, l >= 0 for inequalities.
+    let f = |x: Vector<f64>| -> f64 { (x[0] - 1.0) ** 2 + (x[1] - 2.5) ** 2 };
+    let hs = [
+        Constraint::ge(|x: Vector<f64>| -> f64 { x[0] - 2.0 * x[1] + 2.0 }, 0.0),
+        Constraint::ge(|x: Vector<f64>| -> f64 { -x[0] - 2.0 * x[1] + 6.0 }, 0.0),
+        Constraint::ge(|x: Vector<f64>| -> f64 { -x[0] + 2.0 * x[1] + 2.0 }, 0.0),
+    ];
+    let r = try! pkg::auglag(f, [2.0, 0.0], hs, bounds: try! Bounds::uniform(2, 0.0, f64::INFINITY));
+    close(r.x[0], 1.4, 1e-6, "x1");
+    close(r.x[1], 1.7, 1e-6, "x2");
+    // h_0 = -(x1 - 2 x2 + 2): grad (-1, 2).
+    let g0 = 2.0 * (r.x[0] - 1.0) - r.multipliers[0];
+    let g1 = 2.0 * (r.x[1] - 2.5) + 2.0 * r.multipliers[0];
+    close(g0, 0.0, 1e-5, "stationarity x1");
+    close(g1, 0.0, 1e-5, "stationarity x2");
+    expect(r.multipliers[0] > 0.0 && r.multipliers[1] == 0.0 && r.multipliers[2] == 0.0, f"active set {r.multipliers:?}");
+}
+
+#[test]
+fn infeasible_is_reported() {
+    let f = |x: Vector<f64>| -> f64 { x[0] * x[0] };
+    let a = Constraint::ge(|x: Vector<f64>| -> f64 { x[0] }, 2.0);
+    let b = Constraint::le(|x: Vector<f64>| -> f64 { x[0] }, 1.0);
+    let r = try! pkg::auglag(f, [0.0], [a, b], opts: pkg::Options { max_iter: 15 });
+    expect(r.status == Status::Infeasible && r.violation > 0.1, f"{r}");
+}
+
+#[test]
+fn no_constraints_is_plain_minimization() {
+    let r = try! pkg::auglag(pkg::problems::rosenbrock(), [-1.2, 1.0], []);
+    expect(r.success() && r.fun < 1e-10 && r.multipliers.len() == 0, f"{r}");
+}

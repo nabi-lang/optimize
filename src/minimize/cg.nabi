@@ -1,0 +1,106 @@
+// Nonlinear conjugate gradients (Nocedal and Wright 2006, 5.2): O(n)
+// memory, no matrix at all. Polak-Ribiere+ (beta clipped at 0, which
+// restarts along -g when progress stalls) is the robust choice;
+// Fletcher-Reeves converges globally under strong Wolfe with c2 < 1/2
+// but can creep.
+
+use pkg::IntoObjective;
+use pkg::error::OptimizeError;
+use pkg::line::search;
+use pkg::minimize::{done, flat, report, start, tiny};
+use pkg::objective::{dot, inf_norm};
+use pkg::result::{Minimum, Options, Status};
+use core::array::Vector;
+use linalg::AsVector;
+
+/// The `beta` formula of `cg`.
+///
+/// ```nabi
+/// use optimize::Conjugate;
+///
+/// let m = try optimize::cg(optimize::problems::rosenbrock(), [-1.2, 1.0], Conjugate::FletcherReeves);
+/// assert(m.fun < 1e-8);
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Conjugate {
+    /// Polak-Ribiere+: `max(0, g^T (g - g_old) / g_old^T g_old)`.
+    PolakRibiere,
+    /// Fletcher-Reeves: `g^T g / g_old^T g_old`.
+    FletcherReeves,
+}
+
+/// Nonlinear conjugate gradients with a strong Wolfe line search
+/// (`c2 = 0.1`), restarting along `-g` every `n` iterations and
+/// whenever the direction stops descending. `O(n)` memory; often more
+/// iterations than `lbfgs`, each a little cheaper.
+///
+/// ```nabi
+/// let m = try optimize::cg(optimize::problems::rosenbrock(), [-1.2, 1.0]);
+/// assert(m.success() && (m.x[1] - 1.0).abs() < 1e-4);
+/// ```
+pub fn cg<F: IntoObjective, X: AsVector<f64>>(f: F, x0: X, beta: Conjugate = Conjugate::PolakRibiere, opts: Options = Options {}) throws (OptimizeError) -> Minimum {
+    let x0: Vector<f64> = x0.as_vector();
+    let (ev, x, fx, g) = try start(f.into_objective(), x0, true);
+    let n = x.len();
+    let iters = opts.iters(n, 200);
+    let name = match beta { Conjugate::PolakRibiere => "CG (Polak-Ribiere+)", Conjugate::FletcherReeves => "CG (Fletcher-Reeves)" };
+    if inf_norm(g) <= opts.gtol { return done(ev, x, fx, g, Status::Converged, 0, name); }
+    let p = g .* -1.0;
+    let gg = dot(g, g);
+    let a0 = (1.0 / inf_norm(g)).min(1.0);
+    let k = 0;
+    let since = 0;
+    let status = Status::MaxIterations;
+    let retried = false;
+    while k < iters {
+        let d0 = dot(g, p);
+        let ls = search(opts.line_search, ref ev, x, fx, g, p, a0, 1e10, 1e-4, 0.1);
+        if !ls.ok {
+            if !retried && since > 0 {
+                p = g .* -1.0;
+                since = 0;
+                retried = true;
+                a0 = (1.0 / inf_norm(g)).min(1.0);
+                continue;
+            }
+            status = Status::LineSearchFailed;
+            break;
+        }
+        retried = false;
+        let s = ls.x .- x;
+        let f_old = fx;
+        let g_old = g;
+        x = ls.x;
+        fx = ls.f;
+        g = ls.g;
+        k += 1;
+        since += 1;
+        if !fx.is_finite() { status = Status::NotFinite; break; }
+        if report(opts, k, x, fx, g) { status = Status::Stopped; break; }
+        if inf_norm(g) <= opts.gtol || flat(f_old, fx, opts.ftol) { status = Status::Converged; break; }
+        if tiny(s, x, opts.xtol) { status = Status::Stalled; break; }
+        if opts.evals_out(ev.nfev) { status = Status::MaxEvaluations; break; }
+        let gg_new = dot(g, g);
+        let b = match beta {
+            Conjugate::PolakRibiere => ((gg_new - dot(g, g_old)) / gg).max(0.0),
+            Conjugate::FletcherReeves => gg_new / gg,
+        };
+        if since >= n {
+            b = 0.0;
+            since = 0;
+        }
+        let pn = b .* p .- g;
+        let dn = dot(g, pn);
+        if !(dn < 0.0) {
+            pn = g .* -1.0;
+            dn = -gg_new;
+            since = 0;
+        }
+        // Initial step from the last one (Nocedal and Wright 3.60).
+        a0 = (ls.alpha * d0 / dn).min(1e10);
+        if !(a0 > 0.0) { a0 = 1.0; }
+        p = pn;
+        gg = gg_new;
+    }
+    done(ev, x, fx, g, status, k, name)
+}

@@ -1,0 +1,132 @@
+// Scalar roots on the test functions of Alefeld, Potra and Shi (1995)
+// with closed-form roots, every bracketing method against every
+// other; the open methods; scalar minimizers; errors and edge cases.
+
+use pkg::tests::suite::{close, expect};
+use pkg::{Dual, OptimizeError, Status};
+
+struct Case {
+    f: fn(f64) -> f64;
+    a: f64;
+    b: f64;
+    root: f64;
+}
+
+fn cases() -> List<Case> {
+    [
+        Case { f: |x: f64| -> f64 { x.sin() - x / 2.0 }, a: f64::PI / 2.0, b: f64::PI, root: 1.895494267033981 },
+        Case { f: |x: f64| -> f64 { x ** 3 - 2.0 * x - 5.0 }, a: 2.0, b: 3.0, root: 2.0945514815423265 },
+        Case { f: |x: f64| -> f64 { x.cos() - x }, a: 0.0, b: 1.0, root: 0.7390851332151607 },
+        Case { f: |x: f64| -> f64 { x.exp() - 1e4 }, a: 0.0, b: 20.0, root: 1e4f64.ln() },
+        Case { f: |x: f64| -> f64 { x * (-x).exp() - 0.1 }, a: 0.0, b: 1.0, root: 0.11183255915896297 },
+        Case { f: |x: f64| -> f64 { 1.0 / x - 2.0 }, a: 0.1, b: 1.0, root: 0.5 },
+        Case { f: |x: f64| -> f64 { x ** 20 - 1.0 }, a: 0.0, b: 1.5, root: 1.0 },
+        Case { f: |x: f64| -> f64 { (1.0 + (1.0 - 20.0) ** 2) * x - (1.0 - 20.0 * x) ** 2 }, a: 0.0, b: 1.0, root: f64::NAN },
+        Case { f: |x: f64| -> f64 { x.ln() }, a: 0.5, b: 5.0, root: 1.0 },
+        Case { f: |x: f64| -> f64 { (x - 1.0) * x.exp() }, a: -2.0, b: 3.0, root: 1.0 },
+    ]
+}
+
+#[test]
+fn bracketing_methods_agree_on_known_roots() {
+    let cs = cases();
+    for i in 0..cs.len() {
+        let c = cs[i];
+        let rs = [try! pkg::bisect(c.f, c.a, c.b), try! pkg::brentq(c.f, c.a, c.b), try! pkg::ridder(c.f, c.a, c.b), try! pkg::toms748(c.f, c.a, c.b)];
+        let names = ["bisect", "brentq", "ridder", "toms748"];
+        for k in 0..4 {
+            let r = rs[k];
+            expect(r.success(), f"{names[k]} case {i}: {r}");
+            if c.root != c.root {
+                // A quadratic with two roots in [a, b]; check the residual.
+                close((c.f)(r.x), 0.0, 1e-9, f"{names[k]} case {i} residual");
+            } else {
+                close(r.x, c.root, 4e-12 * c.root.abs().max(1.0), f"{names[k]} case {i}");
+            }
+        }
+        // The interpolating methods use far fewer evaluations.
+        expect(rs[3].nfev <= rs[0].nfev && rs[1].nfev <= rs[0].nfev, f"case {i}: toms748 {rs[3].nfev}, brentq {rs[1].nfev}, bisect {rs[0].nfev}");
+    }
+}
+
+#[test]
+fn tolerances_and_endpoints() {
+    let f = |x: f64| -> f64 { x - 1.0 / 3.0 };
+    let r = try! pkg::brentq(f, 0.0, 1.0, xtol: 1e-3, rtol: 1e-15);
+    expect((r.x - 1.0 / 3.0).abs() <= 1e-3, "loose xtol");
+    let e = try! pkg::bisect(|x: f64| -> f64 { x }, 0.0, 1.0);
+    expect(e.x == 0.0 && e.nfev == 2, "root at an end");
+    let s = try! pkg::toms748(|x: f64| -> f64 { if x < 0.25 { -1.0 } else { 1.0 } }, 0.0, 1.0);
+    close(s.x, 0.25, 1e-11, "a jump is found as a sign change");
+    let m = try! pkg::brentq(|x: f64| -> f64 { (x - 1.0) ** 3 }, 0.0, 3.0, max_iter: 300);
+    close(m.x, 1.0, 1e-11, "triple root");
+    let few = try! pkg::bisect(|x: f64| -> f64 { x - 0.3 }, 0.0, 1.0, max_iter: 5);
+    expect(few.status == Status::MaxIterations, "bisect max_iter");
+}
+
+#[test]
+fn errors_name_the_fix() {
+    let err = |f: fn() throws (OptimizeError)| -> str { try { f(); "" } catch e: OptimizeError { f"{e}" } };
+    let e1 = err(|| { _ = try pkg::brentq(|x: f64| -> f64 { x * x + 1.0 }, -1.0, 1.0); });
+    expect(e1.contains("same sign") && e1.contains("bracket_root"), e1);
+    let e2 = err(|| { _ = try pkg::bisect(|x: f64| -> f64 { x }, f64::NAN, 1.0); });
+    expect(e2.contains("NaN"), e2);
+    let e3 = err(|| { _ = try pkg::ridder(|x: f64| -> f64 { x }, -1.0, 1.0, rtol: 0.0); });
+    expect(e3.contains("rtol"), e3);
+    let e4 = err(|| { _ = try pkg::secant(|x: f64| -> f64 { x }, 1.0, 1.0); });
+    expect(e4.contains("x0 == x1"), e4);
+    let e5 = err(|| { _ = try pkg::bounded(|x: f64| -> f64 { x }, 2.0, 1.0); });
+    expect(e5.contains("lo") && e5.contains("hi"), e5);
+}
+
+#[test]
+fn bracket_root_expands() {
+    let (a, b) = try! pkg::bracket_root(|x: f64| -> f64 { x - 1e5 }, 0.0, 1.0);
+    expect(a <= 1e5 && 1e5 <= b, "expands to the root");
+    let r = try! pkg::brentq(|x: f64| -> f64 { x - 1e5 }, a, b);
+    close(r.x, 1e5, 1e-6, "then brentq");
+    expect((try? pkg::bracket_root(|x: f64| -> f64 { x * x + 1.0 }, 0.0, 1.0)) == none, "no sign change anywhere");
+}
+
+#[test]
+fn open_methods() {
+    let f = |x: f64| -> f64 { x ** 3 - 2.0 * x - 5.0 };
+    let df = |x: f64| -> f64 { 3.0 * x * x - 2.0 };
+    let d2 = |x: f64| -> f64 { 6.0 * x };
+    let want = 2.0945514815423265;
+    let n = try! pkg::newton(f, df, 2.0, tol: 1e-14);
+    let h = try! pkg::halley(f, df, d2, 2.0, tol: 1e-14);
+    let s = try! pkg::secant(f, 2.0, 3.0, tol: 1e-14);
+    let a = try! pkg::newton_ad(|x: Dual| -> Dual { x ** 3 - 2.0 * x - 5.0 }, 2.0, tol: 1e-14);
+    for r in [n, h, s, a] {
+        expect(r.success(), f"{r}");
+        close(r.x, want, 1e-14, "open method root");
+    }
+    expect(h.iterations <= n.iterations && n.iterations <= s.iterations, f"orders: halley {h.iterations}, newton {n.iterations}, secant {s.iterations}");
+    let z = try! pkg::newton(|x: f64| -> f64 { x * x + 1.0 }, |x: f64| -> f64 { 2.0 * x }, 0.0);
+    expect(z.status == Status::Stalled, "zero derivative");
+    let d = try! pkg::newton(|x: f64| -> f64 { x.atan() }, |x: f64| -> f64 { 1.0 / (1.0 + x * x) }, 3.0, max_iter: 20);
+    expect(!d.success(), "Newton diverges on atan from 3");
+}
+
+#[test]
+fn scalar_minima() {
+    let f = |x: f64| -> f64 { (x - 2.0) ** 2 + 1.0 };
+    let br = try! pkg::bracket(f, 0.0, 0.5);
+    expect(br.fb < br.fa && br.fb < br.fc, "bracket");
+    let g = try! pkg::golden(f, br);
+    let b = try! pkg::brent(f, br);
+    let u = try! pkg::bounded(f, -10.0, 10.0);
+    let m = try! pkg::minimize_scalar(f);
+    for r in [g, b, u, m] {
+        expect(r.success(), f"{r}");
+        close(r.x, 2.0, 1e-5, "minimizer");
+        close(r.fun, 1.0, 1e-10, "minimum");
+    }
+    expect(b.nfev < g.nfev, f"brent {b.nfev} beats golden {g.nfev} on a parabola");
+    let edge = try! pkg::bounded(|x: f64| -> f64 { -x }, 0.0, 1.0);
+    close(edge.x, 1.0, 1e-5, "minimum at the upper end");
+    let flat = try? pkg::bracket(|x: f64| -> f64 { -x }, 0.0, 1.0, max_iter: 50);
+    expect(flat == none, "unbounded below: no bracket");
+    expect((try? pkg::Bracket::new(f, 0.0, 5.0, 6.0)) == none, "not a bracket");
+}
