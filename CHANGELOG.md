@@ -2,7 +2,13 @@
 
 All notable changes to this package. Versions follow semver, independent of the Nabi toolchain.
 
-## 0.1.0 (unreleased)
+## 0.1.1 (2026-11-22)
+
+- The crate docs now carry the fitting and optimization tutorial (roots,
+  minimization, bounds, curve fitting, linear programming), moved from
+  the Nabi docs site; its examples run as doc tests.
+
+## 0.1.0 (2026-11-22)
 
 First release.
 

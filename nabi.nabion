@@ -1,6 +1,6 @@
 Package {
     name: "optimize",
-    version: "0.1.0",
+    version: "0.1.1",
     nabi_version: "0.1.0",
     toolchain: "0.1",
     description: "Numerical optimization on core arrays: root finding, minimization, constraints, linear and quadratic programming, least squares, curve fitting, global search; derivatives by automatic differentiation",
