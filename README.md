@@ -169,7 +169,7 @@ its reference.
 
 ## Docs
 
-https://packages.nabi-lang.org/packages/optimize/latest/docs
+https://docs.nabi-lang.org/packages/optimize/latest
 
 ## License
 
