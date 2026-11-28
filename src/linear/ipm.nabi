@@ -21,7 +21,6 @@ struct Kkt {
     hd: Vector<f64>;
     hf: linalg::Cholesky<f64>?;
     nf: linalg::Cholesky<f64>?;
-    ha: Matrix<f64>;
     kf: linalg::Lu<f64>?;
 }
 
@@ -94,7 +93,7 @@ fn factor(a: Matrix<f64>, q: Matrix<f64>, quad: bool, d: Vector<f64>) -> Kkt {
             }
         }
         let kf = try? linalg::lu(k);
-        if kf != none { return Kkt { a, quad, hd, hf: none, nf: none, ha: Array::zeros([0, 0]), kf }; }
+        if kf != none { return Kkt { a, quad, hd, hf: none, nf: none, kf }; }
     }
     let hf: linalg::Cholesky<f64>? = none;
     let ha: Matrix<f64> = Array::zeros([n, m]);
@@ -131,7 +130,7 @@ fn factor(a: Matrix<f64>, q: Matrix<f64>, quad: bool, d: Vector<f64>) -> Kkt {
             k += 1;
         }
     }
-    Kkt { a, quad, hd, hf, nf, ha, kf: none }
+    Kkt { a, quad, hd, hf, nf, kf: none }
 }
 
 /// The largest step in [0, 1] keeping `v + a dv > 0`, times 0.995.
